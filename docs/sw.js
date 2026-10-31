@@ -3,7 +3,7 @@
 // Keep this version in step with VERSION in version.js - test/version.test.mjs
 // checks it. Reusing a cache name across releases leaves installed copies
 // serving the previous build forever.
-const CACHE = 'lora-chat-0.16.0';
+const CACHE = 'lora-chat-0.16.2';
 const SHELL = [
   './',
   'index.html',
@@ -51,7 +51,10 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
+  // ignoreSearch: the page asks for cache-busted URLs like favicon.svg?v=2,
+  // which would otherwise miss the unversioned entry cached above and 404
+  // offline.
   e.respondWith(
-    caches.match(e.request).then((hit) => hit || fetch(e.request))
+    caches.match(e.request, { ignoreSearch: true }).then((hit) => hit || fetch(e.request))
   );
 });

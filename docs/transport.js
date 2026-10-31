@@ -43,6 +43,12 @@ export class WebSerialTransport {
     });
     await this.#resetBoard();
 
+    // One writer for the connection's lifetime, plus a chain that serialises
+    // writes: two overlapping send() calls (an ack while a timer fires) would
+    // otherwise both call getWriter() and the second would throw "locked".
+    this.writer = this.port.writable.getWriter();
+    this.sendChain = Promise.resolve();
+
     this.onClose = onClose;
     this.running = true;
     this.#readLoop(new LineSplitter(onLine));
@@ -82,18 +88,21 @@ export class WebSerialTransport {
   }
 
   async send(text) {
-    const writer = this.port.writable.getWriter();
-    try {
-      await writer.write(new TextEncoder().encode(text + '\n'));
-    } finally {
-      writer.releaseLock();
-    }
+    const data = new TextEncoder().encode(text + '\n');
+    // The caller sees this write's own outcome; the chain itself swallows
+    // failures so one bad write does not poison every later send.
+    const turn = this.sendChain.then(() => this.writer.write(data));
+    this.sendChain = turn.catch(() => {});
+    return turn;
   }
 
   async disconnect() {
     this.running = false;
     try {
       await this.reader?.cancel();
+    } catch {}
+    try {
+      this.writer?.releaseLock();
     } catch {}
     try {
       await this.port?.close();

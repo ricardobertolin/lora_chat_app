@@ -70,3 +70,20 @@ export function displayName(node) {
   if (!node) return 'peer';
   return node.nick || node.name;
 }
+
+// Remembers the last `cap` (sender, seq) pairs seen. When our ack is lost on
+// the air the sender retries the same message; the receiver must acknowledge
+// it again but not render a second bubble. seen() returns true for a repeat
+// and records first sightings.
+export function createSeen(cap = 32) {
+  const keys = [];
+  return {
+    seen(who, seq) {
+      const key = `${who}0000${seq}`;
+      if (keys.includes(key)) return true;
+      keys.push(key);
+      if (keys.length > cap) keys.shift();
+      return false;
+    },
+  };
+}

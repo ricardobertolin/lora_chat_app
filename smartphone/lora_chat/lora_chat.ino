@@ -55,6 +55,20 @@
 #define OLED_COLS 21  // 128 px / 6 px per char at text size 1
 #define MSG_LINES 3   // how many wrapped lines of the last message we show
 
+// On battery the OLED is the biggest steady drain after the ESP32 itself, so
+// blank it after a quiet spell. Any message, or a press of the PRG button,
+// turns it back on. 0 disables the timeout.
+#define OLED_SLEEP_MS 60000
+#define PIN_BUTTON 0  // PRG
+
+// Battery sense: GPIO37 low connects VBAT through 390k/100k onto GPIO1.
+// If this always reads 0.0 V with a battery attached, your board revision
+// gates the divider the other way - change ADC_CTRL_ON to HIGH.
+#define PIN_ADC_CTRL 37
+#define PIN_VBAT 1
+#define ADC_CTRL_ON LOW
+#define VBAT_DIVIDER 4.9f  // (390k + 100k) / 100k
+
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);  // reset handled by hand below
 
@@ -66,6 +80,8 @@ static size_t inLen = 0;
 static uint32_t lastCharAt = 0;
 
 static bool oledOk = false;
+static bool oledAwake = true;
+static uint32_t oledLastActive = 0;
 static String lastMsg = "waiting...";
 static bool lastWasRx = false;
 static float lastRssi = 0;
@@ -114,10 +130,39 @@ static void oledPowerOn() {
   delay(20);
 }
 
+// Returns 0 when no battery is attached (USB power reads well under 2.5 V).
+static float batteryVolts() {
+  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON);
+  delay(2);  // let the divider settle
+  uint32_t mv = analogReadMilliVolts(PIN_VBAT);
+  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON == LOW ? HIGH : LOW);
+  float v = (mv / 1000.0f) * VBAT_DIVIDER;
+  return v >= 2.5f ? v : 0.0f;
+}
+
+// Every draw counts as activity and turns a sleeping panel back on, so the
+// screen is lit exactly when something on it changed recently.
+static void oledWake() {
+  oledLastActive = millis();
+  if (oledOk && !oledAwake) {
+    oled.ssd1306_command(SSD1306_DISPLAYON);
+    oledAwake = true;
+  }
+}
+
+static void oledSleepCheck() {
+  if (!oledOk || !oledAwake || OLED_SLEEP_MS == 0) return;
+  if (millis() - oledLastActive >= OLED_SLEEP_MS) {
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+    oledAwake = false;
+  }
+}
+
 static void drawScreen() {
   if (!oledOk) {
     return;
   }
+  oledWake();
 
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
@@ -145,7 +190,12 @@ static void drawScreen() {
   }
 
   oled.setCursor(0, 56);
-  oled.printf("TX %lu   RX %lu", txCount, rxCount);
+  oled.printf("TX %lu  RX %lu", txCount, rxCount);
+  float vbat = batteryVolts();
+  if (vbat > 0) {
+    oled.setCursor(104, 56);
+    oled.printf("%.1fV", vbat);
+  }
   oled.display();
 }
 
@@ -308,6 +358,12 @@ static bool handleCommand(const char *line) {
   } else if (!strcmp(verb, "status")) {
     printCfg("~~ on");
     Serial.printf("~~ node %s, TX %lu, RX %lu\n", nodeName, txCount, rxCount);
+    float vbat = batteryVolts();
+    if (vbat > 0) {
+      Serial.printf("~~ battery %.2f V\n", vbat);
+    } else {
+      Serial.println("~~ battery not detected (USB power?)");
+    }
   } else if (!strcmp(verb, "revert")) {
     if (revertAt == 0) {
       Serial.println("!! nothing to revert");
@@ -418,6 +474,8 @@ static void pollRadio() {
     int marker = msg.indexOf(CFG_PREFIX);
     if (marker >= 0) {
       RadioCfg next;
+      // A chat message that merely contains "!CFG " parses as nothing and
+      // falls through to the normal path, which re-arms the receiver.
       if (parseCfgMessage(msg.substring(marker), next)) {
         RadioCfg old = cfg;
         cfg = next;
@@ -430,9 +488,9 @@ static void pollRadio() {
           applyCfg(cfg);
           Serial.printf("!! could not follow the change, code %d\n", st);
         }
+        drawScreen();
+        return;  // applyCfg already re-armed the receiver
       }
-      drawScreen();
-      return;  // applyCfg already re-armed the receiver
     }
   } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
     Serial.println("!! packet dropped, CRC mismatch");
@@ -448,8 +506,15 @@ static void pollRadio() {
 }
 
 void setup() {
+  // A LoRa transmit blocks for hundreds of ms at high SF while the phone keeps
+  // writing; the default 256-byte buffer can drop input in that window.
+  Serial.setRxBufferSize(1024);
   Serial.begin(115200);
   delay(2000);  // give the USB bridge time to enumerate before the first print
+
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_ADC_CTRL, OUTPUT);
+  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON == LOW ? HIGH : LOW);
 
   strncpy(nodeName, NODE_NAME, sizeof(nodeName) - 1);
   if (nodeName[0] == '\0') {
@@ -494,9 +559,26 @@ void setup() {
   Serial.println("/help lists the radio commands.");
 }
 
+// PRG wakes the screen and refreshes the stats it shows. Edge-triggered with a
+// debounce, so holding it does not redraw in a loop.
+static void pollButton() {
+  static bool wasDown = false;
+  static uint32_t lastEdge = 0;
+  bool down = digitalRead(PIN_BUTTON) == LOW;
+  if (down != wasDown && millis() - lastEdge > 30) {
+    lastEdge = millis();
+    wasDown = down;
+    if (down) {
+      drawScreen();
+    }
+  }
+}
+
 void loop() {
   pollRadio();
   pollSerial();
+  pollButton();
+  oledSleepCheck();
 
   // Give the other board something to hear after a settings change.
   if (probeAt && (int32_t)(millis() - probeAt) >= 0) {

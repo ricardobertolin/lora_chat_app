@@ -5,4 +5,4 @@
 // cache name would leave installed copies serving the previous build forever.
 // test/version.test.mjs enforces that they match.
 
-export const VERSION = '0.16.0';
+export const VERSION = '0.16.2';

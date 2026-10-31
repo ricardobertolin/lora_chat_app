@@ -257,18 +257,25 @@
   input:focus { outline: none; background: var(--panel-2); }
   form button { border-left: 1px solid var(--line); }
 
+  /* Advisory, not an error: it only reminds you both boards have to agree on
+     the radio settings. It used to be shown and never hidden, so a red bar sat
+     over the log forever. Now it is styled as a notice, times out, and a tap
+     dismisses it - the settings themselves live in the header subtitle. */
   #banner {
     padding: 8px 16px;
-    background: var(--red);
-    border-bottom: 1px solid var(--line);
-    color: #fff;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line-dim);
+    border-left: 3px solid var(--acid);
+    color: var(--ink-dim);
     font-size: 13px;
     letter-spacing: 3px;
     text-transform: uppercase;
     display: none;
     flex: 0 0 auto;
+    cursor: pointer;
   }
   #banner.show { display: block; }
+  #banner:hover { color: var(--ink); }
 
   #updateBar {
     display: none;
@@ -703,8 +710,15 @@
   <div class="prow">
     <strong>Outbox</strong>
     <span id="outState" class="muted">empty</span>
+    <button id="outRetry" class="ghost sm">Send now</button>
     <button id="outClear" class="ghost sm">Clear</button>
   </div>
+  <div class="hint">
+    Messages that could not be sent yet. The red number on SET is how many are
+    waiting. They go out on their own once a board is connected, or press
+    Send now. Clear throws them away.
+  </div>
+  <div id="outList" class="peers" hidden></div>
   <div class="prow">
     <strong>Channel</strong>
     <button id="shareBtn2" class="ghost sm">Share setup</button>

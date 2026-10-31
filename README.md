@@ -1,21 +1,27 @@
 # Heltec WiFi LoRa 32 (V3) point-to-point link
 
 Two Heltec V3 boards (ESP32-S3 + SX1262) talking to each other over raw LoRa.
-There are two sketches:
+There are three sketches, grouped by hardware model (see `modelos-hardware.md`):
 
-- **`lora_chat`** - you type, the other board prints it. Same firmware on both.
+- **`smartphone/lora_chat`** - you type, the other board prints it. Same
+  firmware on both. Pairs with the web app in `docs/` for the pocket-modem
+  model.
+- **`standalone/lora_tracker`** - no phone needed: GPS module on each board,
+  positions over LoRa, distance/bearing on the OLED. Same firmware on both.
 - **`lora_pingpong`** - automatic link test, `COM4` pings every 3 s and `COM6`
   answers. Good for checking the radio without touching a keyboard.
 
-`lora_chat` is what is currently flashed to both boards.
+`lora_chat` is what is currently flashed to both boards. All sketches speak
+the same radio protocol, so mixed setups (tracker + phone) work.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `lora_chat/lora_chat.ino` | Manual chat firmware. Identical on both boards; each names itself from its MAC. |
+| `smartphone/lora_chat/lora_chat.ino` | Manual chat firmware. Identical on both boards; each names itself from its MAC. See `smartphone/README.md`. |
+| `standalone/lora_tracker/lora_tracker.ino` | GPS tracker firmware, phone-free. See `standalone/README.md` for wiring. |
 | `lora_pingpong/lora_pingpong.ino` | Automatic ping/pong. Role picked at build time by `-DROLE_PING`. |
-| `flash.ps1` | Compile + upload a role (`chat`, `ping`, `pong`) to one or more ports. |
+| `flash.ps1` | Compile + upload a role (`chat`, `tracker`, `ping`, `pong`) to one or more ports. |
 | `chat.py` | Terminal chat client for one port. |
 | `docs/` | Browser chat client for desktop + Android, published by GitHub Pages. See its own README. |
 | `monitor.py` | Print both serial ports side by side, read-only. |
@@ -41,7 +47,7 @@ You also need the **esp32 core 3.3.8+** (Arduino IDE: Boards Manager -> esp32).
 
 ### From the Arduino IDE
 
-1. **File > Open** -> `lora_chat/lora_chat.ino`.
+1. **File > Open** -> `smartphone/lora_chat/lora_chat.ino`.
 2. **Tools > Board > esp32 > Heltec WiFi LoRa 32(V3)**.
 3. **Tools > Port > COM4**, then Upload.
 4. Open the Serial Monitor (magnifier icon), set **115200 baud** and line ending
@@ -112,6 +118,10 @@ code instead of the board just going quiet.
 
 A missing screen is not fatal - the sketch logs `OLED not found at 0x3C` and
 carries on as a serial-only chat.
+
+To spare the battery the screen blanks after a minute of silence; any message
+or a press of the PRG button brings it back. When a LiPo is attached its
+voltage appears in the corner and in `/status`.
 
 ## Ping/pong link test
 

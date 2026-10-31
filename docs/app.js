@@ -87,6 +87,8 @@ const els = {
   nickSave: document.getElementById('nickSave'),
   outState: document.getElementById('outState'),
   outClear: document.getElementById('outClear'),
+  outRetry: document.getElementById('outRetry'),
+  outList: document.getElementById('outList'),
   outCount: document.getElementById('outCount'),
   soundState: document.getElementById('soundState'),
   soundToggle: document.getElementById('soundToggle'),
@@ -155,6 +157,8 @@ let myNick = null;
 let msgSeq = 0;
 const pendingAcks = new Map();   // seq -> { el, timer, text }
 let queued = [];                 // outbox, persisted
+// A retried message (its ack was lost) is re-acked but not shown again.
+const seenChats = msg.createSeen();
 
 // Encryption --------------------------------------------------------------
 // The passphrase is kept in localStorage so the app is usable across reloads.
@@ -214,13 +218,43 @@ function setConnected(on) {
   els.input.placeholder = on ? 'Type a message' : 'Not connected - messages will be queued';
   if (on) els.input.focus();
   updateSubtitle();
+  // "Send now" is only meaningful with a board attached.
+  renderOutbox();
 }
 
 function updateSubtitle() {
   const bits = [];
   if (nodeName) bits.push(`node ${nodeName}`);
+  // The radio settings used to live only in a banner that was never dismissed.
+  // Keeping them here means the banner can come and go without losing them.
+  if (nodeName) bits.push(`${currentFreq} MHz · SF${currentSf}`);
   if (lastRssi !== null) bits.push(`last RSSI ${lastRssi} dBm`);
   els.sub.textContent = bits.length ? bits.join(' · ') : 'not connected';
+}
+
+// The banner is a reminder, not an error, so it must not stay on screen: show
+// it only when the settings actually change, time it out, and let a tap clear
+// it early.
+const BANNER_MS = 12000;
+let bannerTimer = null;
+let bannerShownFor = '';
+
+function hideBanner() {
+  clearTimeout(bannerTimer);
+  bannerTimer = null;
+  els.banner.classList.remove('show');
+}
+
+function showRadioBanner(freq, sf) {
+  const key = `${freq}|${sf}`;
+  // Reconnecting re-prints the same radio line; repeating a notice you have
+  // already read is exactly what made it feel permanent.
+  if (key === bannerShownFor) return;
+  bannerShownFor = key;
+  els.banner.textContent = `${freq} MHz · SF${sf} - the other board must match (tap to dismiss)`;
+  els.banner.classList.add('show');
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(hideBanner, BANNER_MS);
 }
 
 function atBottom() {
@@ -295,6 +329,8 @@ function bubble({ mine, who, text, rssi, snr, locked, status, at, persist = true
     history.save(log);
     renderHistoryState();
   }
+  // sendChat keeps this element to flip its delivery tag as acks come in.
+  return wrap;
 }
 
 function renderHistoryState() {
@@ -345,11 +381,21 @@ async function handleRecv(ev) {
   updateSubtitle();
 
   // Firmware control traffic is never encrypted - the board has to read it.
+  // It still proves the peer is alive, so presence is touched on the way out
+  // (a !CFG announcement carries no sender name, so only !CFGOK can be).
   if (ev.text.startsWith('!CFGOK')) {
+    if (ev.from) {
+      presence.touchNode(nodes, ev.from, Date.now(), { rssi: ev.rssi, snr: ev.snr });
+      renderPosition();
+    }
     note(`${ev.from || 'peer'} confirmed the new radio settings`);
     return;
   }
   if (ev.text.startsWith('!CFG ')) {
+    if (ev.from) {
+      presence.touchNode(nodes, ev.from, Date.now(), { rssi: ev.rssi, snr: ev.snr });
+      renderPosition();
+    }
     note(`${ev.from || 'peer'} changed the radio: ${ev.text.slice(5)}`);
     return;
   }
@@ -458,6 +504,10 @@ async function handleRecv(ev) {
 
   // A sequenced chat message: show it, then confirm receipt.
   const chat = msg.decodeMessage(text);
+  if (chat && seenChats.seen(who, chat.seq)) {
+    sendText(msg.encodeAck(who, chat.seq)).catch(() => {});
+    return;
+  }
   const shown = chat ? chat.text : text;
   bubble({
     mine: false,
@@ -520,6 +570,7 @@ function handleLine(raw) {
       currentFreq = ev.freq;
       currentBw = ev.bw;
       currentPower = ev.power;
+      updateSubtitle();
       note(ev.text.replace(/^~~\s*/, ''));
       break;
     case 'banner':
@@ -530,8 +581,8 @@ function handleLine(raw) {
     case 'radio':
       currentSf = ev.sf;
       currentFreq = ev.freq;
-      els.banner.textContent = `${ev.freq} MHz · SF${ev.sf} - the other board must match`;
-      els.banner.classList.add('show');
+      updateSubtitle();
+      showRadioBanner(ev.freq, ev.sf);
       break;
     case 'error':
       note(ev.text, true);
@@ -648,7 +699,9 @@ async function sendPosition() {
   }
   if (!transport) return;
   try {
-    await transport.send(encodePosition(myPos));
+    // Through sendText, not the raw transport: the receive path decrypts
+    // before classifying, so a position deserves the passphrase too.
+    await sendText(encodePosition(myPos));
   } catch (err) {
     note(`position send failed: ${err.message}`, true);
   }
@@ -831,6 +884,10 @@ async function finishAssembly(asm, who, rssi, snr) {
     // would, so it is rendered and acknowledged through the identical path.
     const line = new TextDecoder().decode(bytes);
     const chat = msg.decodeMessage(line);
+    if (chat && seenChats.seen(who, chat.seq)) {
+      sendText(msg.encodeAck(who, chat.seq)).catch(() => {});
+      return;
+    }
     bubble({
       mine: false,
       who: msg.displayName(nodes.get(who)),
@@ -1301,6 +1358,9 @@ function togglePanel(target) {
     p.classList.remove('show');
   }
   if (!wasOpen) target.classList.add('show');
+  // Hiding the settings panel mid-scan must not leave the camera running
+  // (and its indicator lit) behind a panel that is no longer on screen.
+  if (scanStream && !els.setPanel.classList.contains('show')) stopScan();
 }
 
 els.testBtn.addEventListener('click', () => {
@@ -1338,9 +1398,27 @@ function setBubbleStatus(el, state) {
 }
 
 function renderOutbox() {
+  const n = queued.length;
   els.outState.textContent = outbox.describe(queued);
-  els.outCount.textContent = queued.length ? String(queued.length) : '';
-  els.outCount.hidden = !queued.length;
+  els.outCount.textContent = n ? String(n) : '';
+  els.outCount.hidden = !n;
+  // The badge was a bare red number with nothing to say what it meant or how
+  // to get rid of it. Both buttons live behind this same Set button.
+  els.outCount.title = n
+    ? `${outbox.describe(queued)} to send - open Set to send or clear them`
+    : '';
+  els.outClear.disabled = !n;
+  els.outRetry.disabled = !n || !transport;
+
+  els.outList.hidden = !n;
+  els.outList.textContent = '';
+  for (const item of queued) {
+    const row = document.createElement('div');
+    row.className = 'peer';
+    const when = new Date(item.at).toLocaleTimeString();
+    row.textContent = `${when}  ${item.text}`;
+    els.outList.appendChild(row);
+  }
 }
 
 function queueMessage(text, why) {
@@ -1378,7 +1456,7 @@ async function sendChat(text) {
     if (!started) {
       setBubbleStatus(el, 'failed');
       queueMessage(text, 'could not start the transfer');
-      return;
+      return false;
     }
   } else {
     try {
@@ -1386,7 +1464,7 @@ async function sendChat(text) {
     } catch (err) {
       setBubbleStatus(el, 'failed');
       queueMessage(text, `send failed: ${err.message}`);
-      return;
+      return false;
     }
   }
 
@@ -1400,6 +1478,7 @@ async function sendChat(text) {
       queueMessage(text, 'no acknowledgement');
     }, ackWindow),
   });
+  return true;
 }
 
 function resolveAck(seq) {
@@ -1420,11 +1499,21 @@ async function flushOutbox() {
 
   try {
     while (queued.length && transport) {
+      // A long message from the queue starts a fragment transfer; the next one
+      // must wait it out or sendBlob refuses it and the flush marks it failed.
+      const idleAt = Date.now() + 5 * 60 * 1000;
+      while (outgoing && transport && Date.now() < idleAt) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (outgoing || !transport) break;
+
       const item = queued[0];
       queued = outbox.remove(queued, item.id);
       outbox.save(queued);
       renderOutbox();
-      await sendChat(item.text);
+      // A failed send re-queues the item; retrying it immediately would just
+      // spin every 1.5 s against a link that is not passing traffic.
+      if (!(await sendChat(item.text))) break;
       await new Promise((r) => setTimeout(r, 1500));
     }
   } finally {
@@ -1576,8 +1665,9 @@ els.copyLink.addEventListener('click', async () => {
   const setup = channel.setupFromHash(location.hash);
   if (!setup) return;
   // Strip it straight away: the passphrase should not sit in the address bar
-  // or in browser history.
-  history.replaceState(null, '', location.pathname + location.search);
+  // or in browser history. window.history explicitly - the import named
+  // `history` above shadows the browser global here.
+  window.history.replaceState(null, '', location.pathname + location.search);
   await applySetup(setup, 'the link you opened');
 })();
 
@@ -1636,11 +1726,27 @@ els.nickSave.addEventListener('click', () => {
 });
 
 els.outClear.addEventListener('click', () => {
+  const n = queued.length;
+  if (!n) return;
+  // Clearing throws away something you wrote, and the button sits next to one
+  // that does the opposite, so make the discard deliberate.
+  if (!confirm(`Discard ${n} unsent message${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
   outbox.clear();
   queued = [];
   renderOutbox();
-  note('outbox cleared');
+  note(`outbox cleared - ${n} message${n === 1 ? '' : 's'} discarded`);
 });
+
+els.outRetry.addEventListener('click', () => {
+  if (!queued.length) return;
+  if (!transport) {
+    note('no board connected - the outbox goes out by itself once you connect', true);
+    return;
+  }
+  flushOutbox();
+});
+
+els.banner.addEventListener('click', hideBanner);
 
 els.histKeep.addEventListener('click', () => {
   keepHistory = !keepHistory;
@@ -1750,6 +1856,35 @@ function stopPresence(sayGoodbye) {
 // A closing tab should not look like a node that crashed.
 window.addEventListener('pagehide', () => stopPresence(true));
 
+// Keep the screen awake while a board is attached. A locked phone throttles
+// timers and freezes the WebUSB read loop, which silently kills the link -
+// inbound messages, ringing and position sharing all stop. Best effort: an old
+// browser without the API just keeps its usual lock behaviour.
+let wakeLock = null;
+
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator) || !transport || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => {
+      wakeLock = null;
+    });
+  } catch {
+    // Denied (battery saver, hidden page). The link degrades as before.
+  }
+}
+
+function releaseWakeLock() {
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
+
+// The lock is dropped by the browser whenever the page is hidden; take it back
+// when the user returns, if we are still connected.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) acquireWakeLock();
+});
+
 async function connect() {
   const Transport = pickTransport();
   if (!Transport) {
@@ -1770,9 +1905,11 @@ async function connect() {
         note('board disconnected');
         transport = null;
         setConnected(false);
+        releaseWakeLock();
       },
     });
     setConnected(true);
+    acquireWakeLock();
     note(`connected over ${Transport.label}`);
     // Give the board a moment to finish booting before announcing ourselves,
     // then send anything that piled up while there was no radio.
@@ -1803,6 +1940,7 @@ async function disconnect() {
   const t = transport;
   transport = null;
   setConnected(false);
+  releaseWakeLock();
   try {
     await t?.disconnect();
   } catch {}
