@@ -201,6 +201,7 @@ static volatile uint16_t bleMtu = 23;
 
 static uint8_t bleTxBuf[BLE_TX_QUEUE];
 static size_t bleTxHead = 0, bleTxTail = 0;  // both touched only from loop()
+static uint32_t bleTxDropped = 0;            // whole writes refused, see /status
 
 static portMUX_TYPE bleRxLock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t bleRxBuf[BLE_RX_QUEUE];
@@ -210,15 +211,20 @@ static bool bleConnected() {
   return bleEnabled && bleConn != BLE_HS_CONN_HANDLE_NONE;
 }
 
-// Dropping the oldest output would corrupt a line already half-sent, so a full
-// queue drops the newest instead and the reader just misses a diagnostic.
+// All or nothing. Each print lands here as one call, so refusing the whole
+// write costs the reader a complete line, while appending as much as fits
+// would hand it a truncated one spliced onto the next - far worse, because a
+// corrupted line still parses as something and poisons the conversation.
 static void bleQueueTx(const uint8_t *data, size_t len) {
   if (!bleConnected()) return;
+  size_t used = (bleTxHead + BLE_TX_QUEUE - bleTxTail) % BLE_TX_QUEUE;
+  if (used + len + 1 >= BLE_TX_QUEUE) {
+    bleTxDropped++;
+    return;
+  }
   for (size_t i = 0; i < len; i++) {
-    size_t next = (bleTxHead + 1) % BLE_TX_QUEUE;
-    if (next == bleTxTail) return;
     bleTxBuf[bleTxHead] = data[i];
-    bleTxHead = next;
+    bleTxHead = (bleTxHead + 1) % BLE_TX_QUEUE;
   }
 }
 
@@ -358,17 +364,23 @@ static void blePump() {
     feedChar(bleIn, (char)c);
   }
 
-  // Outbound: at most a few notifications per loop, each up to one MTU.
+  // Outbound: a few notifications per loop, each up to one MTU.
   if (!bleConnected() || !bleTx) return;
   const size_t chunk = bleMtu > 3 ? bleMtu - 3 : 20;
-  for (int budget = 4; budget > 0 && bleTxTail != bleTxHead; budget--) {
+  for (int budget = 8; budget > 0 && bleTxTail != bleTxHead; budget--) {
     uint8_t packet[256];
     size_t n = 0;
-    while (n < chunk && n < sizeof(packet) && bleTxTail != bleTxHead) {
-      packet[n++] = bleTxBuf[bleTxTail];
-      bleTxTail = (bleTxTail + 1) % BLE_TX_QUEUE;
+    // Peek. The tail only moves once the notify is accepted - advancing it
+    // first and then breaking on a failed notify silently ate those bytes out
+    // of the middle of a line, which is what produced mangled text on the
+    // phone and left it unable to decrypt anything.
+    size_t tail = bleTxTail;
+    while (n < chunk && n < sizeof(packet) && tail != bleTxHead) {
+      packet[n++] = bleTxBuf[tail];
+      tail = (tail + 1) % BLE_TX_QUEUE;
     }
-    if (!bleTx->notify(packet, n, bleConn)) break;  // retry on the next loop
+    if (!bleTx->notify(packet, n, bleConn)) break;  // keep them, retry next loop
+    bleTxTail = tail;
   }
 }
 
@@ -641,6 +653,9 @@ static bool handleCommand(const char *line) {
     out.printf("~~ node %s, TX %lu, RX %lu\n", nodeName, txCount, rxCount);
     out.printf("~~ bluetooth %s%s\n", bleEnabled ? "on" : "off",
                   bleConnected() ? ", phone connected" : "");
+    // Non-zero means the phone could not keep up and whole lines were refused.
+    // It should stay at 0; anything else is worth knowing about.
+    if (bleTxDropped) out.printf("~~ bluetooth dropped %lu lines\n", bleTxDropped);
     float vbat = batteryVolts();
     if (vbat > 0) {
       out.printf("~~ battery %.2f V\n", vbat);
@@ -677,6 +692,30 @@ static bool handleCommand(const char *line) {
   return true;
 }
 
+// The app's protocol lines are meaningless on the board's own screen: an
+// encrypted message is a wall of base64, and presence and acks are noise. Map
+// them to something a human can read. Only the OLED gets this - USB and BLE
+// still carry the raw line, which is what the app parses.
+static String screenText(const String &line) {
+  int colon = line.indexOf(": ");
+  String who = colon >= 0 ? line.substring(0, colon + 2) : "";
+  String body = colon >= 0 ? line.substring(colon + 2) : line;
+
+  if (body.startsWith("!ENC")) return who + "[encrypted]";
+  if (body.startsWith("!ACK")) return who + "[delivered]";
+  if (body.startsWith("!HI")) return who + "[hello]";
+  if (body.startsWith("!POS")) return who + "[position]";
+  if (body.startsWith("!CALLOK")) return who + "[answered]";
+  if (body.startsWith("!CALLNO")) return who + "[declined]";
+  if (body.startsWith("!CALL")) return who + "[calling]";
+  if (body.startsWith("!B")) return who + "[file]";
+  if (body.startsWith("!M")) {
+    int sp = body.indexOf(' ');  // "!M<seq> the actual text"
+    return sp > 0 ? who + body.substring(sp + 1) : who + "[message]";
+  }
+  return line;  // a plain message, including one that happens to contain ": "
+}
+
 static void sendLine(LineIn &in) {
   if (in.len == 0) {
     return;
@@ -693,19 +732,20 @@ static void sendLine(LineIn &in) {
   if (state == RADIOLIB_ERR_NONE) {
     out.printf(">> %s\n", in.buf);
     txCount++;
-    lastMsg = in.buf;
+    lastMsg = screenText(in.buf);
     lastWasRx = false;
   } else {
     out.printf("!! send failed, code %d\n", state);
     lastMsg = "send failed";
     lastWasRx = false;
   }
-  drawScreen();
-
   // transmit() raises DIO1 on TxDone, which sets the same flag the RX path
-  // uses - drop it so we don't read a phantom packet.
+  // uses - drop it so we don't read a phantom packet. Re-arm before drawing:
+  // the other end's ack comes straight back, and the redraw is slow enough to
+  // miss it.
   packetWaiting = false;
   radio.startReceive();
+  drawScreen();
 }
 
 static void feedChar(LineIn &in, char c) {
@@ -747,13 +787,24 @@ static void pollRadio() {
 
   String msg;
   int state = radio.readData(msg);
+  // Read the signal figures before re-arming: startReceive() clears them.
+  const float rssi = radio.getRSSI();
+  const float snr = radio.getSNR();
+
+  // Start listening again before anything slow happens. Printing the line and
+  // pushing the whole OLED framebuffer over I2C cost tens of milliseconds, and
+  // the radio hears nothing for all of it. Hand-typed chat never generated
+  // enough traffic to notice; the app's presence, ack and position messages do,
+  // and packets were being lost in that window.
+  radio.startReceive();
+
   if (state == RADIOLIB_ERR_NONE) {
-    lastRssi = radio.getRSSI();
-    lastSnr = radio.getSNR();
+    lastRssi = rssi;
+    lastSnr = snr;
     out.printf("<< %s  (RSSI %.1f dBm, SNR %.1f dB)\n", msg.c_str(),
                   lastRssi, lastSnr);
     rxCount++;
-    lastMsg = msg;
+    lastMsg = screenText(msg);
     lastWasRx = true;
 
     // Hearing anything at all proves the settings still work.
@@ -778,7 +829,7 @@ static void pollRadio() {
           out.printf("!! could not follow the change, code %d\n", st);
         }
         drawScreen();
-        return;  // applyCfg already re-armed the receiver
+        return;  // applyCfg re-armed the receiver on the new settings
       }
     }
   } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
@@ -790,8 +841,7 @@ static void pollRadio() {
     lastMsg = "RX error";
     lastWasRx = false;
   }
-  drawScreen();
-  radio.startReceive();
+  drawScreen();  // the receiver is already listening again
 }
 
 void setup() {

@@ -207,6 +207,7 @@ let callTimer = null;      // we are calling out
 let ringingFrom = null;    // someone is calling us
 let ringWatchdog = null;
 let dismissedUntil = 0;
+let dismissedFrom = null;  // the quiet period only applies to who you hung up on
 
 // Media transfer ----------------------------------------------------------
 // Give up on a fragment whose echo never came back, and on an inbound transfer
@@ -1340,8 +1341,14 @@ function stopCalling(reason) {
 
 function startRinging(who) {
   // A caller repeats every few seconds. Without this the next !CALL would
-  // simply start the ringing again a moment after you dismissed it.
-  if (Date.now() < dismissedUntil) return;
+  // simply start the ringing again a moment after you dismissed it. Scoped to
+  // the caller you actually hung up on: a blanket mute made the device deaf to
+  // everyone for a minute, which read as "calls only work one way".
+  if (who === dismissedFrom && Date.now() < dismissedUntil) {
+    // Silence here is what made this impossible to diagnose from the log.
+    note(`${who} is calling again - still quiet from the last dismissal`);
+    return;
+  }
 
   clearTimeout(ringWatchdog);
   // If the caller gives up, stop ringing rather than waiting forever.
@@ -1357,6 +1364,7 @@ function startRinging(who) {
 
 function stopRinging(answer, reason, silent = false) {
   if (!ringingFrom) return;
+  const who = ringingFrom;
   clearTimeout(ringWatchdog);
   audio.stopRinging();
   els.callBanner.classList.remove('show');
@@ -1365,7 +1373,14 @@ function stopRinging(answer, reason, silent = false) {
   // Tell the caller either way, so a decline actually stops them repeating.
   // The quiet period covers that reply being lost on the air.
   if (!silent) sendText(answer ? '!CALLOK' : '!CALLNO').catch(() => {});
-  if (!answer) dismissedUntil = Date.now() + DISMISS_QUIET_MS;
+
+  // Only an actual dismissal earns a quiet period, and only for that caller.
+  // The watchdog path (silent) is a call that simply ended - muting on that
+  // meant every missed call left you unreachable for the next minute.
+  if (!answer && !silent) {
+    dismissedFrom = who;
+    dismissedUntil = Date.now() + DISMISS_QUIET_MS;
+  }
   note(reason);
 }
 
