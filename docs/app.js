@@ -395,6 +395,15 @@ async function sendText(text) {
   return true;
 }
 
+// U+FFFD renders as a bare "?" diamond that says nothing about what arrived.
+// Showing the code point instead turns "spammed garbage" into evidence.
+function escapeForNote(text, max = 80) {
+  const shown = text.length > max ? `${text.slice(0, max)}...` : text;
+  return shown.replace(/[^\x20-\x7E]/g, (c) =>
+    `<U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}>`
+  );
+}
+
 async function handleRecv(ev) {
   lastRssi = ev.rssi;
   updateSubtitle();
@@ -443,6 +452,16 @@ async function handleRecv(ev) {
     }
     text = plain;
     locked = true;
+  }
+
+  // U+FFFD is what TextDecoder emits for bytes that are not valid UTF-8. The
+  // board only ever sends ASCII, so one of these is proof that bytes were
+  // mangled between the board and here - never something a person typed.
+  // Classifying a damaged line is how walls of junk ended up in the chat.
+  // Written as an escape so no editor or encoding round-trip can mangle it.
+  if (text.includes('\uFFFD')) {
+    note(`corrupted line from ${who} (${linkMode}): ${escapeForNote(text)}`, true);
+    return;
   }
 
   // Hearing anything is proof of presence, whatever the message turns out to be.
@@ -527,6 +546,16 @@ async function handleRecv(ev) {
     sendText(msg.encodeAck(who, chat.seq)).catch(() => {});
     return;
   }
+
+  // "!" is reserved for the protocol. Anything still unrecognised here is
+  // damaged protocol traffic, not something anybody typed, and bubbling it put
+  // walls of !POS and base64 into the conversation. Report it as a diagnostic
+  // instead, with the raw bytes made visible so it can actually be chased.
+  if (!chat && text.startsWith('!')) {
+    note(`unreadable protocol line from ${who}: ${escapeForNote(text)}`, true);
+    return;
+  }
+
   const shown = chat ? chat.text : text;
   bubble({
     mine: false,
@@ -568,6 +597,12 @@ async function handleSent(ev) {
   if (/^!(PING|PONG|CALL|CALLOK|CALLNO|ACK|HI|BYE|M\d)/.test(text)) return;
   if (isPosition(text)) {
     note(`sent position (${myPos ? myPos.source : 'unknown'})`);
+    return;
+  }
+  // As on the receive side: a damaged echo of our own control traffic is not
+  // something to show as a message we typed.
+  if (text.startsWith('!')) {
+    note(`sent an unreadable protocol line: ${escapeForNote(text)}`, true);
     return;
   }
   bubble({ mine: true, text, locked });

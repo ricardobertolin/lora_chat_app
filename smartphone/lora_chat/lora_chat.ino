@@ -366,7 +366,17 @@ static void blePump() {
 
   // Outbound: a few notifications per loop, each up to one MTU.
   if (!bleConnected() || !bleTx) return;
-  const size_t chunk = bleMtu > 3 ? bleMtu - 3 : 20;
+
+  // Ask the stack rather than trusting the value onMTUChange left behind. A
+  // notification longer than the real MTU is truncated by the controller while
+  // notify() still reports success, so an MTU we believed but no longer held
+  // would silently eat the tail of every packet - and a byte lost out of the
+  // middle of a line is exactly what shows up on the phone as a replacement
+  // character. Clamped to the safe 20-byte default when it cannot be read.
+  uint16_t mtu = bleServer ? bleServer->getPeerMTU(bleConn) : 0;
+  if (mtu < 23) mtu = bleMtu;
+  if (mtu < 23) mtu = 23;
+  const size_t chunk = mtu - 3;
   for (int budget = 8; budget > 0 && bleTxTail != bleTxHead; budget--) {
     uint8_t packet[256];
     size_t n = 0;
