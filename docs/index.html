@@ -113,6 +113,10 @@
   .dot { width: 7px; height: 7px; background: var(--line-dim); }
   .pill.on { color: #000; background: var(--acid); border-color: var(--acid); }
   .pill.on .dot { background: #000; }
+  /* Battery reads as plain text until it is low, so a healthy board is quiet
+     and only a real problem draws the eye. */
+  #batt[data-level="fair"] { color: var(--fair); border-color: var(--fair); }
+  #batt[data-level="weak"] { color: var(--weak); border-color: var(--weak); }
 
   button {
     font-family: var(--ming);
@@ -617,6 +621,7 @@
   </div>
   <div class="spacer"></div>
   <span class="pill" id="status"><span class="dot"></span><span id="statusText">offline</span></span>
+  <span class="pill" id="batt" hidden title="Board battery"><span id="battText">--</span></span>
   <nav class="acts">
     <button id="chatBtn" class="ghost" title="Back to the conversation">Chat</button>
     <button id="posBtn" class="ghost" title="Position sharing">Pos</button>
@@ -735,6 +740,16 @@
     How the phone reaches the board. Cable is USB-C (OTG on Android).
     Bluetooth needs no cable but is slower; the board must have it on,
     which is the default and the <code>bt</code> mark on its screen.
+  </div>
+  <div class="prow">
+    <strong>Battery</strong>
+    <span id="battDetail" class="muted">unknown</span>
+    <button id="battRefresh" class="ghost sm">Refresh</button>
+  </div>
+  <div class="hint">
+    The board charges from USB-C whenever it is plugged in, including while
+    powered off. There is no charge-status pin on the V3, so "charging" means
+    either the app is on the cable or the voltage is climbing.
   </div>
   <div class="prow">
     <strong>Encryption</strong>

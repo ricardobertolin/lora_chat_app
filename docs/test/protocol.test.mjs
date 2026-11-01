@@ -22,6 +22,19 @@ test('parses a sent echo', () => {
   });
 });
 
+test('parses the battery line without mistaking it for a radio note', () => {
+  const r = parseLine('~~ battery 4.05 V');
+  assert.equal(r.kind, 'battery');
+  assert.equal(r.mv, 4050);
+
+  const none = parseLine('~~ battery not detected (USB power?)');
+  assert.equal(none.kind, 'battery');
+  assert.equal(none.mv, 0);
+
+  // Both are "~~" notes, so the settings line must still win its own match.
+  assert.equal(parseLine('~~ now on 915.000 MHz, SF10, BW 125.0 kHz, 14 dBm').kind, 'cfg');
+});
+
 test('parses the banner and pulls out the node name', () => {
   const r = parseLine('=== LoRa chat - this board is "8424" ===');
   assert.equal(r.kind, 'banner');

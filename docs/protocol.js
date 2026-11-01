@@ -16,6 +16,11 @@ const RADIO_RE = /^on\s+([\d.]+)\s+MHz,\s+SF(\d+)\./;
 const CFG_RE = /^~~\s+.*?([\d.]+)\s+MHz,\s+SF(\d+),\s+BW\s+([\d.]+)\s+kHz,\s+(-?\d+)\s+dBm/;
 // Greedy payload plus an anchored tail, so a message containing "  (RSSI" of
 // its own still splits at the real suffix the firmware appended.
+// "~~ battery 4.05 V", or "~~ battery not detected (USB power?)" with no cell
+// fitted. Pulled out of the generic "~~" notes so polling it does not fill the
+// log with one line every refresh.
+const BATT_RE = /^~~\s+battery\s+([\d.]+)\s*V\b/;
+const BATT_NONE_RE = /^~~\s+battery\s+not detected/;
 const RECV_RE = /^<<\s(.*)\s{2}\(RSSI\s(-?[\d.]+)\sdBm,\sSNR\s(-?[\d.]+)\sdB\)$/;
 const SENT_RE = /^>>\s(.*)$/;
 const ERROR_RE = /^!!\s(.*)$/;
@@ -36,6 +41,12 @@ export function parseLine(raw) {
       text: line,
     };
   }
+
+  // Before CFG_RE: a battery line is also a "~~" note, and must not be mistaken
+  // for one carrying radio settings.
+  const batt = BATT_RE.exec(line);
+  if (batt) return { kind: 'battery', mv: Math.round(parseFloat(batt[1]) * 1000), text: line };
+  if (BATT_NONE_RE.test(line)) return { kind: 'battery', mv: 0, text: line };
 
   const cfgLine = CFG_RE.exec(line);
   if (cfgLine) {

@@ -3,7 +3,7 @@
 // Keep this version in step with VERSION in version.js - test/version.test.mjs
 // checks it. Reusing a cache name across releases leaves installed copies
 // serving the previous build forever.
-const CACHE = 'lora-chat-0.17.4';
+const CACHE = 'lora-chat-0.18.0';
 const SHELL = [
   './',
   'index.html',
@@ -25,6 +25,7 @@ const SHELL = [
   'channel.js',
   'messaging.js',
   'outbox.js',
+  'battery.js',
   'favicon.js',
   'vendor/qrcode.js',
   'backdrop.js',

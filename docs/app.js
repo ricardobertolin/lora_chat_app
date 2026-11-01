@@ -24,6 +24,7 @@ import { VERSION } from './version.js';
 import * as channel from './channel.js';
 import * as msg from './messaging.js';
 import * as outbox from './outbox.js';
+import * as battery from './battery.js';
 import { paintFavicon } from './favicon.js';
 import qrcode from './vendor/qrcode.js';
 import {
@@ -40,6 +41,10 @@ const els = {
   connect: document.getElementById('connect'),
   status: document.getElementById('status'),
   statusText: document.getElementById('statusText'),
+  batt: document.getElementById('batt'),
+  battText: document.getElementById('battText'),
+  battDetail: document.getElementById('battDetail'),
+  battRefresh: document.getElementById('battRefresh'),
   sub: document.getElementById('sub'),
   banner: document.getElementById('banner'),
   log: document.getElementById('log'),
@@ -236,6 +241,8 @@ function setConnected(on) {
   // "Send now" is only meaningful with a board attached.
   renderOutbox();
   renderLinkBar(on);
+  if (on) startBatteryPolling();
+  else stopBatteryPolling();
   // Connecting means you are done setting up and want the conversation. Any
   // panel left open would otherwise sit over the log until dismissed by hand.
   if (on) closePanels();
@@ -637,6 +644,12 @@ function handleLine(raw) {
       currentFreq = ev.freq;
       updateSubtitle();
       showRadioBanner(ev.freq, ev.sf);
+      break;
+    case 'battery':
+      // Polled once a minute, so it deliberately does not write to the log.
+      battPrevMv = battMv;
+      battMv = ev.mv;
+      renderBattery();
       break;
     case 'error':
       note(ev.text, true);
@@ -1457,6 +1470,61 @@ els.dismissBtn.addEventListener('click', () => stopRinging(false, 'call dismisse
 function renderSoundState() {
   els.soundState.textContent = audio.isEnabled() ? 'on' : 'off';
 }
+
+// Battery ------------------------------------------------------------------
+// The board reports a voltage and nothing else, so charging is inferred. See
+// battery.js for why, and for the curve that turns volts into a percentage.
+
+const BATTERY_POLL_MS = 60000;
+let battMv = null;
+let battPrevMv = null;
+let battTimer = null;
+
+function renderBattery() {
+  if (battMv === null) {
+    els.batt.hidden = true;
+    els.battDetail.textContent = transport ? 'asking the board...' : 'connect to read it';
+    return;
+  }
+  const d = battery.describe({
+    mv: battMv,
+    onCable: !!transport && linkMode !== 'bt',
+    prevMv: battPrevMv,
+  });
+  els.batt.hidden = false;
+  els.batt.dataset.level = battery.level(d.pct);
+  // The pill is narrow on a phone, so it gets the short form.
+  els.battText.textContent = d.pct === null ? 'no batt' : `${d.pct}%`;
+  els.batt.title = `Board battery - ${d.text}`;
+  els.battDetail.textContent = d.text;
+}
+
+function askBattery() {
+  if (!transport) return;
+  sendRaw('/bat').catch(() => {});
+}
+
+function startBatteryPolling() {
+  clearInterval(battTimer);
+  askBattery();
+  battTimer = setInterval(askBattery, BATTERY_POLL_MS);
+}
+
+function stopBatteryPolling() {
+  clearInterval(battTimer);
+  battTimer = null;
+  battMv = null;
+  battPrevMv = null;
+  renderBattery();
+}
+
+els.battRefresh.addEventListener('click', () => {
+  if (!transport) {
+    note('connect a board first', true);
+    return;
+  }
+  askBattery();
+});
 
 // Link choice -------------------------------------------------------------
 

@@ -78,12 +78,13 @@
 #define HOLD_BT_MS 3000      // bluetooth on/off
 #define HOLD_OFF_MS 6000     // deep sleep, PRG wakes it again
 
-// Battery sense: GPIO37 low connects VBAT through 390k/100k onto GPIO1.
-// If this always reads 0.0 V with a battery attached, your board revision
-// gates the divider the other way - change ADC_CTRL_ON to HIGH.
+// Battery sense: GPIO37 gates VBAT through a 390k/100k divider onto GPIO1.
+// V3.0 and V3.1+ disagree on which level enables it, and getting it wrong
+// reads a flat 0 V and looks exactly like "no battery fitted". Rather than
+// hardcode a guess, try both at boot and keep whichever actually sees a
+// voltage - the disabled side reads ~0.
 #define PIN_ADC_CTRL 37
 #define PIN_VBAT 1
-#define ADC_CTRL_ON LOW
 #define VBAT_DIVIDER 4.9f  // (390k + 100k) / 100k
 
 // Bluetooth LE ------------------------------------------------------------
@@ -174,13 +175,28 @@ static void oledPowerOn() {
   delay(20);
 }
 
-// Returns 0 when no battery is attached (USB power reads well under 2.5 V).
-static float batteryVolts() {
-  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON);
+static int adcEnableLevel = HIGH;  // settled by batteryBegin()
+
+static float readBatteryAt(int level) {
+  digitalWrite(PIN_ADC_CTRL, level);
   delay(2);  // let the divider settle
   uint32_t mv = analogReadMilliVolts(PIN_VBAT);
-  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON == LOW ? HIGH : LOW);
-  float v = (mv / 1000.0f) * VBAT_DIVIDER;
+  digitalWrite(PIN_ADC_CTRL, level == LOW ? HIGH : LOW);  // leave it disabled
+  return (mv / 1000.0f) * VBAT_DIVIDER;
+}
+
+// Whichever level reads a real voltage is the one that enables the divider.
+static void batteryBegin() {
+  float hi = readBatteryAt(HIGH);
+  float lo = readBatteryAt(LOW);
+  adcEnableLevel = hi >= lo ? HIGH : LOW;
+  Serial.printf("~~ battery sense: HIGH=%.2fV LOW=%.2fV -> enable %s\n", hi, lo,
+                adcEnableLevel == HIGH ? "HIGH" : "LOW");
+}
+
+// Returns 0 when no battery is attached (the pin then reads well under 2.5 V).
+static float batteryVolts() {
+  float v = readBatteryAt(adcEnableLevel);
   return v >= 2.5f ? v : 0.0f;
 }
 
@@ -614,6 +630,17 @@ static bool parseCfgMessage(const String &msg, RadioCfg &out) {
   return validCfg(out);
 }
 
+// One line, same wording from /status and /bat, so the app has a single shape
+// to parse no matter which asked.
+static void printBattery() {
+  float vbat = batteryVolts();
+  if (vbat > 0) {
+    out.printf("~~ battery %.2f V\n", vbat);
+  } else {
+    out.println("~~ battery not detected (USB power?)");
+  }
+}
+
 static void showHelp() {
   out.println("commands:");
   out.println("  /status          show the current radio settings");
@@ -624,6 +651,7 @@ static void showHelp() {
   out.println("  /revert          undo the last change");
   out.println("  /bt on|off       bluetooth radio (remembered across reboots)");
   out.println("  /bt forget       drop paired phones");
+  out.println("  /bat             battery voltage on its own line");
   out.println("  /off             deep sleep; hold PRG to wake");
   out.println("both boards switch together, and roll back if the link drops");
   out.println("PRG button: tap = wake screen, hold 1.2s = screen off,");
@@ -645,6 +673,8 @@ static bool handleCommand(const char *line) {
 
   if (!strcmp(verb, "help")) {
     showHelp();
+  } else if (!strcmp(verb, "bat")) {
+    printBattery();
   } else if (!strcmp(verb, "off")) {
     powerDown();
   } else if (!strcmp(verb, "bt")) {
@@ -666,12 +696,7 @@ static bool handleCommand(const char *line) {
     // Non-zero means the phone could not keep up and whole lines were refused.
     // It should stay at 0; anything else is worth knowing about.
     if (bleTxDropped) out.printf("~~ bluetooth dropped %lu lines\n", bleTxDropped);
-    float vbat = batteryVolts();
-    if (vbat > 0) {
-      out.printf("~~ battery %.2f V\n", vbat);
-    } else {
-      out.println("~~ battery not detected (USB power?)");
-    }
+    printBattery();
   } else if (!strcmp(verb, "revert")) {
     if (revertAt == 0) {
       out.println("!! nothing to revert");
@@ -863,7 +888,8 @@ void setup() {
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(PIN_ADC_CTRL, OUTPUT);
-  digitalWrite(PIN_ADC_CTRL, ADC_CTRL_ON == LOW ? HIGH : LOW);
+  // Before the first drawScreen(), which reports the voltage in its corner.
+  batteryBegin();
 
   strncpy(nodeName, NODE_NAME, sizeof(nodeName) - 1);
   if (nodeName[0] == '\0') {
