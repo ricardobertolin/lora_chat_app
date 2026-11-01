@@ -25,7 +25,7 @@ the same radio protocol, so mixed setups (tracker + phone) work.
 | `chat.py` | Terminal chat client for one port. |
 | `docs/` | Browser chat client for desktop + Android, published by GitHub Pages. See its own README. |
 | `monitor.py` | Print both serial ports side by side, read-only. |
-| `arduino/libraries/` | RadioLib + Adafruit SSD1306/GFX/BusIO. Not tracked - see Toolchain. |
+| `arduino/libraries/` | RadioLib + Adafruit SSD1306/GFX/BusIO + NimBLE-Arduino. Not tracked - see Toolchain. |
 | `build/` | Build output, safe to delete. Not tracked. |
 
 The web app is live at
@@ -38,8 +38,13 @@ The libraries are not in the repo. Install them once:
 
 ```powershell
 $cli = "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-& $cli lib install RadioLib "Adafruit SSD1306" --install-dir .\arduino
+$env:ARDUINO_DIRECTORIES_USER = "$PWD\arduino"
+& $cli lib install RadioLib "Adafruit SSD1306" NimBLE-Arduino
 ```
+
+`--install-dir` was removed from arduino-cli, hence the environment variable:
+it is what points the install at this project's `arduino/` instead of the
+global sketchbook.
 
 You also need the **esp32 core 3.3.8+** (Arduino IDE: Boards Manager -> esp32).
 
@@ -82,6 +87,26 @@ python serve.py
 A page that talks to the board over USB - Web Serial on desktop, WebUSB on
 Android. Same code both places, installable as a PWA, works offline. See
 [`docs/README.md`](docs/README.md); Android additionally needs a USB-C OTG cable.
+
+### Without a cable
+
+`lora_chat` also publishes the same conversation over Bluetooth LE, so the web
+app can reach the board with nothing plugged in. In the app open **Set** and
+switch **Link** to **Bluetooth**, then press Connect and pick `LoRaChat-<name>`
+from the browser's chooser.
+
+The board advertises a Nordic UART Service, which means any generic BLE
+terminal app works too - handy for telling a radio problem from an app problem.
+Bluetooth is on by default; `/bt off` turns it off and the choice survives a
+reboot. `/bt forget` drops paired phones.
+
+Pairing is bonded and encrypted but "just works" - there is no passkey to type.
+That protects the link against passive listening, not against someone actively
+present at the moment you pair. Message privacy is the app's passphrase, which
+is end to end and independent of this.
+
+Bluetooth is slower than the cable, but still well ahead of the LoRa radio
+behind it, so it is not the bottleneck.
 
 Either way it looks like this:
 
@@ -159,6 +184,8 @@ handled by the board and never goes out as a message:
 | `/bw 125` | Bandwidth in kHz (7.8 .. 500, only the SX1262's real steps) |
 | `/power -9..22` | Transmit power in dBm |
 | `/revert` | Undo the last change immediately |
+| `/bt on\|off` | Bluetooth radio, remembered across reboots |
+| `/bt forget` | Drop paired phones |
 | `/help` | List the above |
 
 **Both boards must agree on every setting**, so a change is not applied alone:

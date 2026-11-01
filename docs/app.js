@@ -33,6 +33,7 @@ import {
   alreadyPermitted,
   WebSerialTransport,
   WebUsbCp210xTransport,
+  WebBluetoothTransport,
 } from './transport.js';
 
 const els = {
@@ -85,6 +86,9 @@ const els = {
   scanStop: document.getElementById('scanStop'),
   nickIn: document.getElementById('nickIn'),
   nickSave: document.getElementById('nickSave'),
+  linkState: document.getElementById('linkState'),
+  linkCable: document.getElementById('linkCable'),
+  linkBt: document.getElementById('linkBt'),
   outState: document.getElementById('outState'),
   outClear: document.getElementById('outClear'),
   outRetry: document.getElementById('outRetry'),
@@ -172,6 +176,11 @@ let log = [];  // persisted chat history
 
 // Link test and calling ---------------------------------------------------
 const SOUND_KEY = 'lora-chat-sound';
+
+// Cable or Bluetooth. Remembered, because whichever one you use is a property
+// of how you carry the board, not of a single session.
+const LINK_KEY = 'lora-chat-link';
+let linkMode = 'cable';
 const CALL_REPEAT_MS = 4000;
 
 // Tracked from the firmware's settings lines, so sharing a channel sends what
@@ -1380,6 +1389,41 @@ function renderSoundState() {
   els.soundState.textContent = audio.isEnabled() ? 'on' : 'off';
 }
 
+// Link choice -------------------------------------------------------------
+
+function renderLinkState() {
+  const bt = linkMode === 'bt';
+  els.linkState.textContent = bt
+    ? WebBluetoothTransport.supported
+      ? 'bluetooth'
+      : 'bluetooth (not supported here)'
+    : 'cable';
+  // The chosen one is the solid button, matching how the accent swatches read.
+  els.linkCable.classList.toggle('ghost', bt);
+  els.linkBt.classList.toggle('ghost', !bt);
+}
+
+function setLinkMode(mode) {
+  if (mode === linkMode) return;
+  linkMode = mode;
+  localStorage.setItem(LINK_KEY, mode);
+  renderLinkState();
+  note(
+    transport
+      ? `link set to ${mode === 'bt' ? 'Bluetooth' : 'cable'} - disconnect and connect again to use it`
+      : `link set to ${mode === 'bt' ? 'Bluetooth' : 'cable'}`
+  );
+}
+
+els.linkCable.addEventListener('click', () => setLinkMode('cable'));
+els.linkBt.addEventListener('click', () => {
+  if (!WebBluetoothTransport.supported) {
+    note('This browser has no Web Bluetooth. Use Chrome or Edge.', true);
+    return;
+  }
+  setLinkMode('bt');
+});
+
 els.soundToggle.addEventListener('click', () => {
   const next = !audio.isEnabled();
   audio.setEnabled(next);
@@ -1886,11 +1930,13 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function connect() {
-  const Transport = pickTransport();
+  const Transport = pickTransport(linkMode);
   if (!Transport) {
     note(
-      'This browser has neither Web Serial nor WebUSB. Use Chrome or Edge - ' +
-        'Firefox and Safari do not support either.',
+      linkMode === 'bt'
+        ? 'This browser has no Web Bluetooth. Use Chrome or Edge, or switch the link back to Cable in Set.'
+        : 'This browser has neither Web Serial nor WebUSB. Use Chrome or Edge - ' +
+            'Firefox and Safari do not support either.',
       true
     );
     return;
@@ -1975,11 +2021,11 @@ els.form.addEventListener('submit', async (e) => {
 });
 
 els.diag.addEventListener('click', async () => {
-  const caps = describeCapabilities();
+  const caps = describeCapabilities(linkMode);
   note(
     `diagnostics - app v${VERSION} · ${caps.chosen} · Web Serial ${caps.webSerial ? 'yes' : 'no'}` +
-      ` · WebUSB ${caps.webUsb ? 'yes' : 'no'} · secure ${caps.secureContext}` +
-      ` · android ${caps.android}`
+      ` · WebUSB ${caps.webUsb ? 'yes' : 'no'} · Bluetooth ${caps.webBluetooth ? 'yes' : 'no'}` +
+      ` · secure ${caps.secureContext} · android ${caps.android}`
   );
 
   try {
@@ -2010,14 +2056,23 @@ els.diag.addEventListener('click', async () => {
   }
 });
 
+// A Bluetooth preference saved on a phone is meaningless on a desktop without
+// it, so fall back rather than leaving Connect permanently broken.
+linkMode = localStorage.getItem(LINK_KEY) === 'bt' ? 'bt' : 'cable';
+if (linkMode === 'bt' && !WebBluetoothTransport.supported) linkMode = 'cable';
+renderLinkState();
+
 // Report capability up front so an unsupported browser is obvious immediately.
-const caps = describeCapabilities();
-if (!caps.webSerial && !caps.webUsb) {
-  note('Web Serial and WebUSB are both unavailable in this browser. Use Chrome.', true);
+const caps = describeCapabilities(linkMode);
+if (!caps.webSerial && !caps.webUsb && !caps.webBluetooth) {
+  note('Web Serial, WebUSB and Web Bluetooth are all unavailable in this browser. Use Chrome.', true);
 } else {
   note(`ready - will connect over ${caps.chosen}`);
   if (caps.chosen === 'WebUSB') {
     note('Plug the board in with a USB-C data cable (charge-only cables will not work).');
+  }
+  if (caps.chosen === 'Bluetooth') {
+    note('Bluetooth: the board must be powered and showing "bt" on its screen.');
   }
 }
 

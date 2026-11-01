@@ -13,13 +13,20 @@ about a minute.
 | --- | --- | --- |
 | Windows / Linux desktop | Chrome, Edge | Web Serial (uses the existing COM port) |
 | Android | Chrome | WebUSB (drives the CP2102 directly) |
-| iPhone | - | Not possible; iOS has neither API |
+| Either, no cable | Chrome, Edge | Web Bluetooth (Nordic UART Service) |
+| iPhone | - | Not possible; iOS has none of the three APIs |
 
-Firefox and Safari support neither API on any platform.
+Firefox and Safari support none of them on any platform.
 
-**The firmware needs no changes.** `lora_chat` already speaks newline-delimited
-UTF-8 at 115200, which is exactly what this consumes - the app is `chat.py`
-rewritten in JavaScript.
+Cable is the default and Bluetooth is never chosen automatically, because a
+board already on USB should keep using it. Switch in **Set > Link**; the choice
+is remembered. Over Bluetooth the browser's chooser lists the board as
+`LoRaChat-<name>`.
+
+**The firmware speaks one protocol on both pipes.** `lora_chat` emits
+newline-delimited UTF-8 at 115200 over USB and notifies the identical lines over
+BLE, so everything above `transport.js` is unaware of which is in use - the app
+is `chat.py` rewritten in JavaScript either way.
 
 ## Version
 
@@ -47,7 +54,7 @@ serving the old build forever.
 | `index.html` | Markup and styling. |
 | `app.js` | UI wiring. |
 | `protocol.js` | Parses the firmware's serial lines. No browser APIs, so it is unit-testable. |
-| `transport.js` | Web Serial and WebUSB/CP210x implementations behind one interface. |
+| `transport.js` | Web Serial, WebUSB/CP210x and Web Bluetooth implementations behind one interface. |
 | `position.js` | Position encoding and great-circle maths. Also browser-free and unit-tested. |
 | `crypto.js` | AES-GCM encryption and passphrase key derivation. |
 | `history.js` | Chat history persistence and capping. |
@@ -445,11 +452,17 @@ from the PC - and a USB-C OTG adapter if it is USB-A on the other end.
 | Garbled text | Wrong baud - the board must be on 115200 |
 | "Web Serial and WebUSB unavailable" | Firefox or Safari; use Chrome |
 | Messages send but never arrive | The two boards disagree on frequency or SF |
+| Bluetooth chooser lists nothing | Board's Bluetooth is off (`/bt on`) or it is out of range; the OLED shows `bt` when advertising |
+| Bluetooth connects then drops | Pairing went stale after a reflash - run `/bt forget` on the board and remove it from the OS Bluetooth list |
 
 ## Status
 
 Working on hardware: **Web Serial** on Windows desktop and **WebUSB** on
 Android, both chatting through a Heltec V3.
+
+**Web Bluetooth** is implemented on both sides and the firmware is verified
+advertising, but the over-the-air link has not been tested on a phone yet - the
+desktop it was built on has no Bluetooth radio.
 
 Unit-tested (`npm test`, 101 tests): the serial line parser against output
 captured from real sessions, position encoding and great-circle maths,

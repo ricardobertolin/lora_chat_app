@@ -1,18 +1,26 @@
-// Two ways to reach the same CP2102 bridge on the Heltec board.
+// Three ways to reach the same board.
 //
 //   Desktop Chrome/Edge -> Web Serial. Uses the COM port the CP210x driver
 //     already provides, so nothing about the Arduino toolchain has to change.
 //   Android Chrome      -> WebUSB. Web Serial does not exist on Android, so we
 //     drive the CP2102 directly with its vendor control requests.
+//   Either, no cable    -> Web Bluetooth against the firmware's Nordic UART
+//     Service. Same newline-delimited lines, just a different pipe.
 //
-// Both expose: connect(), send(text), disconnect(), and report lines through
-// the onLine callback given to connect().
+// All three expose: connect(), send(text), disconnect(), and report lines
+// through the onLine callback given to connect().
 
 import { LineSplitter } from './protocol.js';
 
 export const BAUD = 115200;
 const CP210X_VID = 0x10c4;
 const CP210X_PID = 0xea60;
+
+// Nordic UART Service, matching the UUIDs in lora_chat.ino. Named from the
+// board's point of view: it notifies on TX, and we write to RX.
+export const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+export const NUS_RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+export const NUS_TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
 // CP210x vendor requests, from Silicon Labs AN571.
 const REQ_IFC_ENABLE = 0x00;
@@ -206,6 +214,74 @@ export class WebUsbCp210xTransport {
   }
 }
 
+// Web Bluetooth has no MTU accessor, and an un-negotiated ATT link only
+// carries 20 bytes of payload per write. Chunking to that is slow in theory
+// but still an order of magnitude faster than the LoRa radio behind it, so
+// reliability wins over throughput here.
+const BLE_CHUNK = 20;
+
+export class WebBluetoothTransport {
+  static get supported() {
+    return typeof navigator !== 'undefined' && 'bluetooth' in navigator;
+  }
+  static label = 'Bluetooth';
+
+  async connect({ onLine, onClose }) {
+    this.device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_SERVICE] }],
+    });
+
+    this.onClose = onClose;
+    this.running = true;
+    // Walking out of range fires this instead of any read error, so it is the
+    // only reliable place to notice the link dropped.
+    this.handleDrop = () => {
+      if (!this.running) return;
+      this.running = false;
+      this.onClose?.();
+    };
+    this.device.addEventListener('gattserverdisconnected', this.handleDrop);
+
+    const server = await this.device.gatt.connect();
+    const service = await server.getPrimaryService(NUS_SERVICE);
+    this.rx = await service.getCharacteristic(NUS_RX_CHAR);
+    this.tx = await service.getCharacteristic(NUS_TX_CHAR);
+
+    const splitter = new LineSplitter(onLine);
+    this.tx.addEventListener('characteristicvaluechanged', (e) => {
+      const v = e.target.value;
+      splitter.push(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+    });
+    await this.tx.startNotifications();
+
+    // Same reason as Web Serial: overlapping sends must not interleave, and
+    // here a half-written line would also be unparseable at the other end.
+    this.sendChain = Promise.resolve();
+  }
+
+  async send(text) {
+    const data = new TextEncoder().encode(text + '\n');
+    const turn = this.sendChain.then(async () => {
+      for (let i = 0; i < data.length; i += BLE_CHUNK) {
+        await this.rx.writeValueWithResponse(data.slice(i, i + BLE_CHUNK));
+      }
+    });
+    this.sendChain = turn.catch(() => {});
+    return turn;
+  }
+
+  async disconnect() {
+    this.running = false;
+    this.device?.removeEventListener('gattserverdisconnected', this.handleDrop);
+    try {
+      await this.tx?.stopNotifications();
+    } catch {}
+    try {
+      this.device?.gatt?.disconnect();
+    } catch {}
+  }
+}
+
 const isAndroid = () =>
   typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent || '');
 
@@ -216,19 +292,26 @@ const isAndroid = () =>
 // Android is checked first and pinned to WebUSB. Chrome on Android can expose a
 // navigator.serial object that never enumerates anything, and picking it would
 // pop an empty port chooser instead of the working WebUSB path.
-export function pickTransport() {
+// `prefer` is the user's choice from the Set panel: 'bt' pins Bluetooth,
+// anything else keeps the historical cable behaviour. Bluetooth is never
+// auto-selected, because a board sitting on a USB cable should keep using it.
+export function pickTransport(prefer = 'cable') {
+  if (prefer === 'bt') {
+    return WebBluetoothTransport.supported ? WebBluetoothTransport : null;
+  }
   if (isAndroid() && WebUsbCp210xTransport.supported) return WebUsbCp210xTransport;
   if (WebSerialTransport.supported) return WebSerialTransport;
   if (WebUsbCp210xTransport.supported) return WebUsbCp210xTransport;
   return null;
 }
 
-export function describeCapabilities() {
-  const chosen = pickTransport();
+export function describeCapabilities(prefer = 'cable') {
+  const chosen = pickTransport(prefer);
   return {
     android: isAndroid(),
     webSerial: WebSerialTransport.supported,
     webUsb: WebUsbCp210xTransport.supported,
+    webBluetooth: WebBluetoothTransport.supported,
     secureContext: typeof isSecureContext === 'undefined' ? null : isSecureContext,
     chosen: chosen ? chosen.label : 'none',
   };

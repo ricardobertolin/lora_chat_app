@@ -10,9 +10,17 @@
 //
 // The onboard OLED mirrors the last message and its signal strength, so you can
 // unplug a board, walk it around and watch RSSI fall off without a laptop.
+//
+// The same line-oriented conversation is also published over Bluetooth LE as a
+// Nordic UART Service, so the web app can talk to the board with no cable (and
+// any generic BLE terminal app can too). USB and BLE are the same pipe: a line
+// arriving on either is handled identically, and every line the board prints
+// goes to both.
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
 #include <RadioLib.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -68,6 +76,21 @@
 #define PIN_VBAT 1
 #define ADC_CTRL_ON LOW
 #define VBAT_DIVIDER 4.9f  // (390k + 100k) / 100k
+
+// Bluetooth LE ------------------------------------------------------------
+// Nordic UART Service UUIDs. Not invented here on purpose: picking the de-facto
+// standard means off-the-shelf BLE terminal apps can drive the board too, which
+// is the quickest way to tell a radio problem from an app problem.
+#define NUS_SERVICE "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_RX_CHAR "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  // phone writes here
+#define NUS_TX_CHAR "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  // board notifies here
+
+// Outgoing bytes are queued rather than pushed from inside print(), because a
+// notify costs milliseconds and print() is called from the middle of the radio
+// path. The queue drains a few packets per loop().
+#define BLE_TX_QUEUE 4096
+// Inbound bytes cross from the NimBLE task to loop(), so this one needs a lock.
+#define BLE_RX_QUEUE 1024
 
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);  // reset handled by hand below
@@ -140,6 +163,191 @@ static float batteryVolts() {
   return v >= 2.5f ? v : 0.0f;
 }
 
+// Bluetooth LE bridge -----------------------------------------------------
+//
+// BLE carries exactly the same newline-terminated lines as USB, so nothing
+// above this layer knows or cares which pipe a message came from.
+
+static void feedChar(char c);  // defined with the serial input, shared by both
+
+static Preferences prefs;
+static bool bleEnabled = true;
+static NimBLEServer *bleServer = nullptr;
+static NimBLECharacteristic *bleTx = nullptr;
+static volatile uint16_t bleConn = BLE_HS_CONN_HANDLE_NONE;
+static volatile uint16_t bleMtu = 23;
+
+static uint8_t bleTxBuf[BLE_TX_QUEUE];
+static size_t bleTxHead = 0, bleTxTail = 0;  // both touched only from loop()
+
+static portMUX_TYPE bleRxLock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t bleRxBuf[BLE_RX_QUEUE];
+static volatile size_t bleRxHead = 0, bleRxTail = 0;
+
+static bool bleConnected() {
+  return bleEnabled && bleConn != BLE_HS_CONN_HANDLE_NONE;
+}
+
+// Dropping the oldest output would corrupt a line already half-sent, so a full
+// queue drops the newest instead and the reader just misses a diagnostic.
+static void bleQueueTx(const uint8_t *data, size_t len) {
+  if (!bleConnected()) return;
+  for (size_t i = 0; i < len; i++) {
+    size_t next = (bleTxHead + 1) % BLE_TX_QUEUE;
+    if (next == bleTxTail) return;
+    bleTxBuf[bleTxHead] = data[i];
+    bleTxHead = next;
+  }
+}
+
+// Mirrors everything the sketch prints to USB onto BLE as well. Serial stays
+// the primary so a board with no phone attached behaves exactly as before.
+class SerialAndBle : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    bleQueueTx(&c, 1);
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t len) override {
+    Serial.write(buf, len);
+    bleQueueTx(buf, len);
+    return len;
+  }
+};
+
+static SerialAndBle out;
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *s, NimBLEConnInfo &info) override {
+    bleConn = info.getConnHandle();
+    bleMtu = 23;
+    // A stale queue from a previous phone would arrive as a burst of
+    // half-finished lines the new one cannot parse.
+    bleTxHead = bleTxTail = 0;
+  }
+  void onDisconnect(NimBLEServer *s, NimBLEConnInfo &info, int reason) override {
+    bleConn = BLE_HS_CONN_HANDLE_NONE;
+    if (bleEnabled) NimBLEDevice::startAdvertising();
+  }
+  void onMTUChange(uint16_t mtu, NimBLEConnInfo &info) override { bleMtu = mtu; }
+};
+
+class BleRxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    // Runs on the NimBLE task: copy out and get off this thread quickly.
+    const std::string v = c->getValue();
+    portENTER_CRITICAL(&bleRxLock);
+    for (char ch : v) {
+      size_t next = (bleRxHead + 1) % BLE_RX_QUEUE;
+      if (next == bleRxTail) break;  // overrun, drop the rest
+      bleRxBuf[bleRxHead] = (uint8_t)ch;
+      bleRxHead = next;
+    }
+    portEXIT_CRITICAL(&bleRxLock);
+  }
+};
+
+static BleServerCallbacks bleServerCallbacks;
+static BleRxCallbacks bleRxCallbacks;
+
+static void bleStart() {
+  char name[24];
+  snprintf(name, sizeof(name), "LoRaChat-%s", nodeName);
+  NimBLEDevice::init(name);
+  NimBLEDevice::setMTU(247);
+  // Bond and encrypt, but "just works" rather than a passkey: the board has a
+  // screen but the pairing prompt Web Bluetooth raises is the browser's, and
+  // demanding a code there is the single most common reason a phone silently
+  // fails to connect. Message privacy is the app's passphrase, not this link.
+  NimBLEDevice::setSecurityAuth(true, false, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(&bleServerCallbacks, false);
+
+  NimBLEService *svc = bleServer->createService(NUS_SERVICE);
+  bleTx = svc->createCharacteristic(
+      NUS_TX_CHAR, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic *rx = svc->createCharacteristic(
+      NUS_RX_CHAR,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC,
+      MAX_MSG_LEN + 32);
+  rx->setCallbacks(&bleRxCallbacks);
+  svc->start();
+
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->setName(name);
+  adv->addServiceUUID(NUS_SERVICE);
+  adv->enableScanResponse(true);
+  adv->start();
+  out.printf("~~ bluetooth on, advertising as \"%s\"\n", name);
+}
+
+static void bleStop() {
+  bleConn = BLE_HS_CONN_HANDLE_NONE;
+  bleTxHead = bleTxTail = 0;
+  bleServer = nullptr;
+  bleTx = nullptr;
+  if (NimBLEDevice::isInitialized()) NimBLEDevice::deinit(true);
+  out.println("~~ bluetooth off");
+}
+
+static void bleSetEnabled(bool on) {
+  if (on == bleEnabled && (on == (bleServer != nullptr))) return;
+  bleEnabled = on;
+  prefs.putBool("bt", on);
+  if (on) bleStart();
+  else bleStop();
+}
+
+static void bleForget() {
+  if (!NimBLEDevice::isInitialized()) {
+    out.println("!! bluetooth is off, nothing to forget");
+    return;
+  }
+  NimBLEDevice::deleteAllBonds();
+  if (bleServer) {
+    for (uint8_t i = 0; i < bleServer->getConnectedCount(); i++) {
+      bleServer->disconnect(bleServer->getPeerInfo(i));
+    }
+  }
+  out.println("~~ bluetooth pairings cleared - pair the phone again");
+}
+
+// Drains both directions. Called every loop(), so the budget keeps a long
+// backlog from starving the radio.
+static void blePump() {
+  if (!bleEnabled) return;
+
+  // Inbound: feed the same line assembler the serial port uses.
+  while (true) {
+    uint8_t c;
+    portENTER_CRITICAL(&bleRxLock);
+    bool got = bleRxTail != bleRxHead;
+    if (got) {
+      c = bleRxBuf[bleRxTail];
+      bleRxTail = (bleRxTail + 1) % BLE_RX_QUEUE;
+    }
+    portEXIT_CRITICAL(&bleRxLock);
+    if (!got) break;
+    feedChar((char)c);
+  }
+
+  // Outbound: at most a few notifications per loop, each up to one MTU.
+  if (!bleConnected() || !bleTx) return;
+  const size_t chunk = bleMtu > 3 ? bleMtu - 3 : 20;
+  for (int budget = 4; budget > 0 && bleTxTail != bleTxHead; budget--) {
+    uint8_t packet[256];
+    size_t n = 0;
+    while (n < chunk && n < sizeof(packet) && bleTxTail != bleTxHead) {
+      packet[n++] = bleTxBuf[bleTxTail];
+      bleTxTail = (bleTxTail + 1) % BLE_TX_QUEUE;
+    }
+    if (!bleTx->notify(packet, n, bleConn)) break;  // retry on the next loop
+  }
+}
+
 // Every draw counts as activity and turns a sleeping panel back on, so the
 // screen is lit exactly when something on it changed recently.
 static void oledWake() {
@@ -170,8 +378,18 @@ static void drawScreen() {
 
   oled.setCursor(0, 0);
   oled.print(nodeName);
-  oled.setCursor(54, 0);
+  oled.setCursor(42, 0);
   oled.printf("%.1f/SF%u", cfg.freq, cfg.sf);
+  // Top right: "bt" greyed when advertising, boxed when a phone is on it.
+  if (bleEnabled) {
+    if (bleConnected()) {
+      oled.fillRect(113, 0, 15, 9, SSD1306_WHITE);
+      oled.setTextColor(SSD1306_BLACK);
+    }
+    oled.setCursor(115, 0);
+    oled.print("bt");
+    oled.setTextColor(SSD1306_WHITE);
+  }
   oled.drawFastHLine(0, 10, OLED_W, SSD1306_WHITE);
 
   // Body: the last message, truncated to what fits so it can never push the
@@ -202,7 +420,7 @@ static void drawScreen() {
 // Stop here, but say why on the screen as well - a board that failed while
 // running on battery has no serial monitor attached to complain to.
 static void halt(const char *what, int code) {
-  Serial.printf("%s failed, code %d - halting\n", what, code);
+  out.printf("%s failed, code %d - halting\n", what, code);
   if (oledOk) {
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
@@ -245,14 +463,14 @@ static int applyCfg(const RadioCfg &c) {
 }
 
 static void printCfg(const char *tag) {
-  Serial.printf("%s %.3f MHz, SF%u, BW %.1f kHz, %d dBm\n", tag, cfg.freq, cfg.sf,
+  out.printf("%s %.3f MHz, SF%u, BW %.1f kHz, %d dBm\n", tag, cfg.freq, cfg.sf,
                 cfg.bw, cfg.power);
 }
 
 static void rawSend(const String &payload) {
   int state = radio.transmit(payload.c_str());
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("!! send failed, code %d\n", state);
+    out.printf("!! send failed, code %d\n", state);
   }
   packetWaiting = false;
   radio.startReceive();
@@ -265,7 +483,7 @@ static void armRevert(const RadioCfg &old) {
   prevCfg = old;
   revertAt = millis() + REVERT_AFTER_MS;
   probeAt = millis() + 300 + (esp_random() % 900);
-  Serial.printf("~~ reverting in %lu s unless the link comes back\n",
+  out.printf("~~ reverting in %lu s unless the link comes back\n",
                 (unsigned long)(REVERT_AFTER_MS / 1000));
 }
 
@@ -281,7 +499,7 @@ static void rollback() {
   RadioCfg broken = cfg;
   cfg = prevCfg;
   int state = applyCfg(cfg);
-  Serial.printf("!! nothing heard after the change - rolled back (code %d)\n", state);
+  out.printf("!! nothing heard after the change - rolled back (code %d)\n", state);
   printCfg("~~ back on");
   lastMsg = "reverted";
   lastWasRx = false;
@@ -293,7 +511,7 @@ static void rollback() {
 // handler and by an incoming !CFG from the other board.
 static bool changeCfg(const RadioCfg &next, bool announce) {
   if (!validCfg(next)) {
-    Serial.println("!! invalid setting, ignored");
+    out.println("!! invalid setting, ignored");
     return false;
   }
   RadioCfg old = cfg;
@@ -310,7 +528,7 @@ static bool changeCfg(const RadioCfg &next, bool announce) {
   if (state != RADIOLIB_ERR_NONE) {
     cfg = old;
     applyCfg(cfg);
-    Serial.printf("!! could not apply, code %d - unchanged\n", state);
+    out.printf("!! could not apply, code %d - unchanged\n", state);
     return false;
   }
   printCfg("~~ now on");
@@ -334,14 +552,16 @@ static bool parseCfgMessage(const String &msg, RadioCfg &out) {
 }
 
 static void showHelp() {
-  Serial.println("commands:");
-  Serial.println("  /status          show the current radio settings");
-  Serial.println("  /sf 7..12        spreading factor (higher = further, slower)");
-  Serial.println("  /freq 902.5      frequency in MHz");
-  Serial.println("  /bw 125          bandwidth in kHz (7.8 .. 500)");
-  Serial.println("  /power -9..22    transmit power in dBm");
-  Serial.println("  /revert          undo the last change");
-  Serial.println("both boards switch together, and roll back if the link drops");
+  out.println("commands:");
+  out.println("  /status          show the current radio settings");
+  out.println("  /sf 7..12        spreading factor (higher = further, slower)");
+  out.println("  /freq 902.5      frequency in MHz");
+  out.println("  /bw 125          bandwidth in kHz (7.8 .. 500)");
+  out.println("  /power -9..22    transmit power in dBm");
+  out.println("  /revert          undo the last change");
+  out.println("  /bt on|off       bluetooth radio (remembered across reboots)");
+  out.println("  /bt forget       drop paired phones");
+  out.println("both boards switch together, and roll back if the link drops");
 }
 
 // Returns true if the line was a command and must not go out over the air.
@@ -353,25 +573,42 @@ static bool handleCommand(const char *line) {
   int got = sscanf(line + 1, "%15s %f", verb, &value);
   if (got < 1) return true;
 
+  // /bt takes a word, not a number, so it is read separately from `value`.
+  char word[16] = {0};
+  sscanf(line + 1, "%*15s %15s", word);
+
   if (!strcmp(verb, "help")) {
     showHelp();
+  } else if (!strcmp(verb, "bt")) {
+    if (!strcmp(word, "on")) {
+      bleSetEnabled(true);
+    } else if (!strcmp(word, "off")) {
+      bleSetEnabled(false);
+    } else if (!strcmp(word, "forget")) {
+      bleForget();
+    } else {
+      out.printf("~~ bluetooth %s%s - try /bt on, /bt off or /bt forget\n",
+                    bleEnabled ? "on" : "off", bleConnected() ? ", phone connected" : "");
+    }
   } else if (!strcmp(verb, "status")) {
     printCfg("~~ on");
-    Serial.printf("~~ node %s, TX %lu, RX %lu\n", nodeName, txCount, rxCount);
+    out.printf("~~ node %s, TX %lu, RX %lu\n", nodeName, txCount, rxCount);
+    out.printf("~~ bluetooth %s%s\n", bleEnabled ? "on" : "off",
+                  bleConnected() ? ", phone connected" : "");
     float vbat = batteryVolts();
     if (vbat > 0) {
-      Serial.printf("~~ battery %.2f V\n", vbat);
+      out.printf("~~ battery %.2f V\n", vbat);
     } else {
-      Serial.println("~~ battery not detected (USB power?)");
+      out.println("~~ battery not detected (USB power?)");
     }
   } else if (!strcmp(verb, "revert")) {
     if (revertAt == 0) {
-      Serial.println("!! nothing to revert");
+      out.println("!! nothing to revert");
     } else {
       rollback();
     }
   } else if (got < 2) {
-    Serial.printf("!! /%s needs a value - try /help\n", verb);
+    out.printf("!! /%s needs a value - try /help\n", verb);
   } else if (!strcmp(verb, "sf")) {
     RadioCfg next = cfg;
     next.sf = (uint8_t)value;
@@ -389,7 +626,7 @@ static bool handleCommand(const char *line) {
     next.power = (int8_t)value;
     changeCfg(next, true);
   } else {
-    Serial.printf("!! unknown command /%s - try /help\n", verb);
+    out.printf("!! unknown command /%s - try /help\n", verb);
   }
   return true;
 }
@@ -408,12 +645,12 @@ static void sendLine() {
   String payload = String(nodeName) + ": " + inBuf;
   int state = radio.transmit(payload.c_str());
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.printf(">> %s\n", inBuf);
+    out.printf(">> %s\n", inBuf);
     txCount++;
     lastMsg = inBuf;
     lastWasRx = false;
   } else {
-    Serial.printf("!! send failed, code %d\n", state);
+    out.printf("!! send failed, code %d\n", state);
     lastMsg = "send failed";
     lastWasRx = false;
   }
@@ -425,24 +662,30 @@ static void sendLine() {
   radio.startReceive();
 }
 
+// One assembler for both pipes. USB and BLE are never typed into at the same
+// time in practice, and sharing it keeps commands, chat and the idle flush
+// behaving identically no matter which one the line arrived on.
+static void feedChar(char c) {
+  lastCharAt = millis();
+
+  if (c == '\r') {
+    return;
+  }
+  if (c == '\n') {
+    sendLine();
+    return;
+  }
+  if (inLen < MAX_MSG_LEN) {
+    inBuf[inLen++] = c;
+  }
+  if (inLen == MAX_MSG_LEN) {
+    sendLine();  // full packet, ship it rather than truncating
+  }
+}
+
 static void pollSerial() {
   while (Serial.available()) {
-    char c = Serial.read();
-    lastCharAt = millis();
-
-    if (c == '\r') {
-      continue;
-    }
-    if (c == '\n') {
-      sendLine();
-      continue;
-    }
-    if (inLen < MAX_MSG_LEN) {
-      inBuf[inLen++] = c;
-    }
-    if (inLen == MAX_MSG_LEN) {
-      sendLine();  // full packet, ship it rather than truncating
-    }
+    feedChar((char)Serial.read());
   }
 
   if (inLen > 0 && millis() - lastCharAt > INPUT_IDLE_MS) {
@@ -461,7 +704,7 @@ static void pollRadio() {
   if (state == RADIOLIB_ERR_NONE) {
     lastRssi = radio.getRSSI();
     lastSnr = radio.getSNR();
-    Serial.printf("<< %s  (RSSI %.1f dBm, SNR %.1f dB)\n", msg.c_str(),
+    out.printf("<< %s  (RSSI %.1f dBm, SNR %.1f dB)\n", msg.c_str(),
                   lastRssi, lastSnr);
     rxCount++;
     lastMsg = msg;
@@ -486,18 +729,18 @@ static void pollRadio() {
         } else {
           cfg = old;
           applyCfg(cfg);
-          Serial.printf("!! could not follow the change, code %d\n", st);
+          out.printf("!! could not follow the change, code %d\n", st);
         }
         drawScreen();
         return;  // applyCfg already re-armed the receiver
       }
     }
   } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
-    Serial.println("!! packet dropped, CRC mismatch");
+    out.println("!! packet dropped, CRC mismatch");
     lastMsg = "CRC mismatch";
     lastWasRx = false;
   } else {
-    Serial.printf("!! readData() failed, code %d\n", state);
+    out.printf("!! readData() failed, code %d\n", state);
     lastMsg = "RX error";
     lastWasRx = false;
   }
@@ -523,7 +766,7 @@ void setup() {
     snprintf(nodeName, sizeof(nodeName), "%02X%02X", mac[4], mac[5]);
   }
 
-  Serial.printf("\n=== LoRa chat - this board is \"%s\" ===\n", nodeName);
+  out.printf("\n=== LoRa chat - this board is \"%s\" ===\n", nodeName);
 
   oledPowerOn();
   Wire.begin(SDA_OLED, SCL_OLED);
@@ -534,7 +777,7 @@ void setup() {
     drawScreen();
   } else {
     // Not fatal - the serial chat works fine without a screen.
-    Serial.println("!! OLED not found at 0x3C, continuing without it");
+    out.println("!! OLED not found at 0x3C, continuing without it");
   }
 
   SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
@@ -554,9 +797,16 @@ void setup() {
     halt("startReceive()", state);
   }
 
-  Serial.printf("on %.1f MHz, SF%d. Type a message and press Enter.\n", cfg.freq,
+  // Last, so a BLE stack that misbehaves cannot stop the radio coming up.
+  prefs.begin("lorachat", false);
+  bleEnabled = prefs.getBool("bt", true);
+  if (bleEnabled) bleStart();
+  else out.println("~~ bluetooth off (/bt on to enable)");
+  drawScreen();
+
+  out.printf("on %.1f MHz, SF%d. Type a message and press Enter.\n", cfg.freq,
                 cfg.sf);
-  Serial.println("/help lists the radio commands.");
+  out.println("/help lists the radio commands.");
 }
 
 // PRG wakes the screen and refreshes the stats it shows. Edge-triggered with a
@@ -577,6 +827,7 @@ static void pollButton() {
 void loop() {
   pollRadio();
   pollSerial();
+  blePump();
   pollButton();
   oledSleepCheck();
 
