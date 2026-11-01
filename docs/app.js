@@ -89,6 +89,11 @@ const els = {
   linkState: document.getElementById('linkState'),
   linkCable: document.getElementById('linkCable'),
   linkBt: document.getElementById('linkBt'),
+  linkBar: document.getElementById('linkBar'),
+  linkBarCable: document.getElementById('linkBarCable'),
+  linkBarBt: document.getElementById('linkBarBt'),
+  linkBarHint: document.getElementById('linkBarHint'),
+  chatBtn: document.getElementById('chatBtn'),
   outState: document.getElementById('outState'),
   outClear: document.getElementById('outClear'),
   outRetry: document.getElementById('outRetry'),
@@ -229,6 +234,10 @@ function setConnected(on) {
   updateSubtitle();
   // "Send now" is only meaningful with a board attached.
   renderOutbox();
+  renderLinkBar(on);
+  // Connecting means you are done setting up and want the conversation. Any
+  // panel left open would otherwise sit over the log until dismissed by hand.
+  if (on) closePanels();
 }
 
 function updateSubtitle() {
@@ -1360,6 +1369,16 @@ function stopRinging(answer, reason, silent = false) {
   note(reason);
 }
 
+// Closing every panel is what "show me the conversation" means, since the log
+// is simply what is underneath them.
+function closePanels() {
+  for (const p of [els.posPanel, els.testPanel, els.setPanel, els.mediaPanel]) {
+    p.classList.remove('show');
+  }
+  if (scanStream) stopScan();
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
 // Only one panel at a time - stacking them pushed the log off a phone screen.
 function togglePanel(target) {
   const wasOpen = target.classList.contains('show');
@@ -1401,6 +1420,23 @@ function renderLinkState() {
   // The chosen one is the solid button, matching how the accent swatches read.
   els.linkCable.classList.toggle('ghost', bt);
   els.linkBt.classList.toggle('ghost', !bt);
+  els.linkBarCable.classList.toggle('ghost', bt);
+  els.linkBarBt.classList.toggle('ghost', !bt);
+
+  if (bt && !WebBluetoothTransport.supported) {
+    els.linkBarHint.textContent = 'This browser has no Bluetooth. Use Chrome or Edge, or pick Cable.';
+  } else if (bt) {
+    els.linkBarHint.textContent =
+      'The board must show "bt" on its screen. Hold its PRG button 3 s to switch Bluetooth on.';
+  } else {
+    els.linkBarHint.textContent = 'USB-C data cable (an OTG one on a phone). Charge-only cables will not work.';
+  }
+}
+
+// The bar is a pre-connection aid, so it only occupies the screen when there
+// is a connection to make.
+function renderLinkBar(connected) {
+  els.linkBar.classList.toggle('show', !connected);
 }
 
 function setLinkMode(mode) {
@@ -1415,14 +1451,20 @@ function setLinkMode(mode) {
   );
 }
 
-els.linkCable.addEventListener('click', () => setLinkMode('cable'));
-els.linkBt.addEventListener('click', () => {
+function chooseBluetooth() {
   if (!WebBluetoothTransport.supported) {
     note('This browser has no Web Bluetooth. Use Chrome or Edge.', true);
     return;
   }
   setLinkMode('bt');
-});
+}
+
+els.linkCable.addEventListener('click', () => setLinkMode('cable'));
+els.linkBt.addEventListener('click', chooseBluetooth);
+els.linkBarCable.addEventListener('click', () => setLinkMode('cable'));
+els.linkBarBt.addEventListener('click', chooseBluetooth);
+
+els.chatBtn.addEventListener('click', closePanels);
 
 els.soundToggle.addEventListener('click', () => {
   const next = !audio.isEnabled();

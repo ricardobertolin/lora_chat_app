@@ -277,6 +277,30 @@
   #banner.show { display: block; }
   #banner:hover { color: var(--ink); }
 
+  #linkBar {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line-dim);
+    flex: 0 0 auto;
+  }
+  #linkBar.show { display: flex; }
+  .lb-label {
+    font-size: 12px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+  .lb-hint {
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: var(--ink-dim);
+    flex: 1 1 100%;
+  }
+
   #updateBar {
     display: none;
     align-items: center;
@@ -594,6 +618,7 @@
   <div class="spacer"></div>
   <span class="pill" id="status"><span class="dot"></span><span id="statusText">offline</span></span>
   <nav class="acts">
+    <button id="chatBtn" class="ghost" title="Back to the conversation">Chat</button>
     <button id="posBtn" class="ghost" title="Position sharing">Pos</button>
     <button id="testBtn" class="ghost" title="Link test and statistics">Test</button>
     <button id="mediaBtn" class="ghost" title="Send an image or audio">Med</button>
@@ -602,6 +627,15 @@
     <button id="connect">Connect</button>
   </nav>
 </header>
+
+<!-- Shown only while disconnected: the link choice has to be in front of you at
+     the moment you press Connect, not buried in a settings panel. -->
+<div id="linkBar">
+  <span class="lb-label">Connect by</span>
+  <button id="linkBarCable" class="ghost sm">Cable</button>
+  <button id="linkBarBt" class="ghost sm">Bluetooth</button>
+  <span id="linkBarHint" class="lb-hint"></span>
+</div>
 
 <div id="callBanner">
   <span id="callText">Incoming call</span>

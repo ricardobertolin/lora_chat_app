@@ -107,9 +107,19 @@ Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);  // reset handled by hand belo
 static char nodeName[16];
 static volatile bool packetWaiting = false;
 
-static char inBuf[MAX_MSG_LEN + 1];
-static size_t inLen = 0;
-static uint32_t lastCharAt = 0;
+// One line assembler per pipe. They must not share a buffer: USB needs an idle
+// timeout (the Serial Monitor can be set to send no newline at all) and BLE
+// must not have one, because the app writes a line in 20-byte chunks and a
+// LoRa transmit blocks for ~230 ms at SF9. A shared buffer let that timeout
+// fire between two chunks and transmit half a line.
+struct LineIn {
+  char buf[MAX_MSG_LEN + 1];
+  size_t len;
+  uint32_t lastCharAt;
+};
+
+static LineIn usbIn = {{0}, 0, 0};
+static LineIn bleIn = {{0}, 0, 0};
 
 static bool oledOk = false;
 static bool oledAwake = true;
@@ -179,8 +189,8 @@ static float batteryVolts() {
 // BLE carries exactly the same newline-terminated lines as USB, so nothing
 // above this layer knows or cares which pipe a message came from.
 
-static void feedChar(char c);   // defined with the serial input, shared by both
-static void powerDown();        // defined with the button, reached by /off too
+static void feedChar(LineIn &in, char c);  // defined with the serial input
+static void powerDown();  // defined with the button, reached by /off too
 
 static Preferences prefs;
 static bool bleEnabled = true;
@@ -235,8 +245,10 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
     bleConn = info.getConnHandle();
     bleMtu = 23;
     // A stale queue from a previous phone would arrive as a burst of
-    // half-finished lines the new one cannot parse.
+    // half-finished lines the new one cannot parse, and half a line left in
+    // the inbound buffer would be transmitted glued to the next one.
     bleTxHead = bleTxTail = 0;
+    bleIn.len = 0;
   }
   void onDisconnect(NimBLEServer *s, NimBLEConnInfo &info, int reason) override {
     bleConn = BLE_HS_CONN_HANDLE_NONE;
@@ -343,7 +355,7 @@ static void blePump() {
     }
     portEXIT_CRITICAL(&bleRxLock);
     if (!got) break;
-    feedChar((char)c);
+    feedChar(bleIn, (char)c);
   }
 
   // Outbound: at most a few notifications per loop, each up to one MTU.
@@ -665,23 +677,23 @@ static bool handleCommand(const char *line) {
   return true;
 }
 
-static void sendLine() {
-  if (inLen == 0) {
+static void sendLine(LineIn &in) {
+  if (in.len == 0) {
     return;
   }
-  inBuf[inLen] = '\0';
-  inLen = 0;
+  in.buf[in.len] = '\0';
+  in.len = 0;
 
-  if (handleCommand(inBuf)) {
+  if (handleCommand(in.buf)) {
     return;
   }
 
-  String payload = String(nodeName) + ": " + inBuf;
+  String payload = String(nodeName) + ": " + in.buf;
   int state = radio.transmit(payload.c_str());
   if (state == RADIOLIB_ERR_NONE) {
-    out.printf(">> %s\n", inBuf);
+    out.printf(">> %s\n", in.buf);
     txCount++;
-    lastMsg = inBuf;
+    lastMsg = in.buf;
     lastWasRx = false;
   } else {
     out.printf("!! send failed, code %d\n", state);
@@ -696,34 +708,34 @@ static void sendLine() {
   radio.startReceive();
 }
 
-// One assembler for both pipes. USB and BLE are never typed into at the same
-// time in practice, and sharing it keeps commands, chat and the idle flush
-// behaving identically no matter which one the line arrived on.
-static void feedChar(char c) {
-  lastCharAt = millis();
+static void feedChar(LineIn &in, char c) {
+  in.lastCharAt = millis();
 
   if (c == '\r') {
     return;
   }
   if (c == '\n') {
-    sendLine();
+    sendLine(in);
     return;
   }
-  if (inLen < MAX_MSG_LEN) {
-    inBuf[inLen++] = c;
+  if (in.len < MAX_MSG_LEN) {
+    in.buf[in.len++] = c;
   }
-  if (inLen == MAX_MSG_LEN) {
-    sendLine();  // full packet, ship it rather than truncating
+  if (in.len == MAX_MSG_LEN) {
+    sendLine(in);  // full packet, ship it rather than truncating
   }
 }
 
 static void pollSerial() {
   while (Serial.available()) {
-    feedChar((char)Serial.read());
+    feedChar(usbIn, (char)Serial.read());
   }
 
-  if (inLen > 0 && millis() - lastCharAt > INPUT_IDLE_MS) {
-    sendLine();
+  // USB only. A terminal set to "No Line Ending" never sends one, so a lull
+  // has to count as end-of-message. BLE always terminates its lines, so
+  // applying this there would cut messages in half instead.
+  if (usbIn.len > 0 && millis() - usbIn.lastCharAt > INPUT_IDLE_MS) {
+    sendLine(usbIn);
   }
 }
 
