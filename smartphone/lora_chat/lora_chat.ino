@@ -25,6 +25,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <esp_mac.h>
+#include <esp_sleep.h>
 
 // SX1262 wiring on the V3. Heltec's variant header calls the SX1262's DIO1 pin
 // "DIO0" (GPIO14) for backwards compatibility with the SX127x V2 boards.
@@ -69,6 +70,14 @@
 #define OLED_SLEEP_MS 60000
 #define PIN_BUTTON 0  // PRG
 
+// How long PRG has to be held for each action. A plain tap just wakes the
+// screen, so nothing destructive can happen by brushing the button. The screen
+// names the action while you hold, which is the only discoverable way to put
+// four functions on one button.
+#define HOLD_SCREEN_MS 1200  // blank the screen now
+#define HOLD_BT_MS 3000      // bluetooth on/off
+#define HOLD_OFF_MS 6000     // deep sleep, PRG wakes it again
+
 // Battery sense: GPIO37 low connects VBAT through 390k/100k onto GPIO1.
 // If this always reads 0.0 V with a battery attached, your board revision
 // gates the divider the other way - change ADC_CTRL_ON to HIGH.
@@ -111,6 +120,8 @@ static float lastRssi = 0;
 static float lastSnr = 0;
 static uint32_t txCount = 0;
 static uint32_t rxCount = 0;
+static String holdHint;        // what releasing PRG would do right now
+static bool holdSwallow = false;  // the press that woke the screen does nothing else
 
 // Runtime radio settings --------------------------------------------------
 // Changing frequency or spreading factor on one board alone kills the link
@@ -168,7 +179,8 @@ static float batteryVolts() {
 // BLE carries exactly the same newline-terminated lines as USB, so nothing
 // above this layer knows or cares which pipe a message came from.
 
-static void feedChar(char c);  // defined with the serial input, shared by both
+static void feedChar(char c);   // defined with the serial input, shared by both
+static void powerDown();        // defined with the button, reached by /off too
 
 static Preferences prefs;
 static bool bleEnabled = true;
@@ -414,7 +426,24 @@ static void drawScreen() {
     oled.setCursor(104, 56);
     oled.printf("%.1fV", vbat);
   }
+
+  // Held-button prompt, inverted along the bottom so it cannot be mistaken for
+  // a message. It replaces the counters only while the button is down.
+  if (holdHint.length()) {
+    oled.fillRect(0, 54, OLED_W, 10, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setCursor(2, 56);
+    oled.print(holdHint);
+    oled.setTextColor(SSD1306_WHITE);
+  }
   oled.display();
+}
+
+// Blank the panel now rather than waiting out OLED_SLEEP_MS.
+static void oledOff() {
+  if (!oledOk || !oledAwake) return;
+  oled.ssd1306_command(SSD1306_DISPLAYOFF);
+  oledAwake = false;
 }
 
 // Stop here, but say why on the screen as well - a board that failed while
@@ -561,7 +590,10 @@ static void showHelp() {
   out.println("  /revert          undo the last change");
   out.println("  /bt on|off       bluetooth radio (remembered across reboots)");
   out.println("  /bt forget       drop paired phones");
+  out.println("  /off             deep sleep; hold PRG to wake");
   out.println("both boards switch together, and roll back if the link drops");
+  out.println("PRG button: tap = wake screen, hold 1.2s = screen off,");
+  out.println("            3s = bluetooth on/off, 6s = power off");
 }
 
 // Returns true if the line was a command and must not go out over the air.
@@ -579,6 +611,8 @@ static bool handleCommand(const char *line) {
 
   if (!strcmp(verb, "help")) {
     showHelp();
+  } else if (!strcmp(verb, "off")) {
+    powerDown();
   } else if (!strcmp(verb, "bt")) {
     if (!strcmp(word, "on")) {
       bleSetEnabled(true);
@@ -807,18 +841,86 @@ void setup() {
   out.printf("on %.1f MHz, SF%d. Type a message and press Enter.\n", cfg.freq,
                 cfg.sf);
   out.println("/help lists the radio commands.");
+  out.println("PRG: tap = screen, hold 3s = bluetooth, hold 6s = power off.");
 }
 
-// PRG wakes the screen and refreshes the stats it shows. Edge-triggered with a
-// debounce, so holding it does not redraw in a loop.
+// Everything off and into deep sleep. This is as close to a power switch as a
+// board with no power switch gets: the CPU, the radio and Bluetooth all stop,
+// and only the RTC stays alive watching PRG. Waking is a fresh boot, so the
+// radio comes back on the settings in flash, not whatever /sf left it on.
+static void powerDown() {
+  out.println("~~ powering down - hold PRG to wake");
+
+  if (oledOk) {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 24);
+    oled.println("  OFF - hold PRG");
+    oled.println("     to wake");
+    oled.display();
+    delay(1200);
+  }
+  oledOff();
+
+  radio.sleep();  // otherwise the SX1262 keeps drawing receive current
+  if (NimBLEDevice::isInitialized()) NimBLEDevice::deinit(true);
+  digitalWrite(Vext, HIGH);  // cut the OLED rail (active LOW)
+
+  // Arming a low-level wake while the button is still down would wake us
+  // immediately, so wait for the release first.
+  while (digitalRead(PIN_BUTTON) == LOW) delay(10);
+  delay(100);
+
+  // PRG is GPIO0, which is in the S3's RTC domain and so can wake from deep
+  // sleep. 0 = wake when it is pulled low again.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
+  esp_deep_sleep_start();
+}
+
+// PRG is the only control on the board, so it carries four actions chosen by
+// how long it is held. Edge-triggered with a debounce; the hint on screen is
+// refreshed only when the wording changes, not every loop.
 static void pollButton() {
   static bool wasDown = false;
-  static uint32_t lastEdge = 0;
+  static uint32_t lastEdge = 0, pressAt = 0;
   bool down = digitalRead(PIN_BUTTON) == LOW;
+
   if (down != wasDown && millis() - lastEdge > 30) {
     lastEdge = millis();
     wasDown = down;
     if (down) {
+      // A press on a dark screen only turns it back on. Without this, reaching
+      // for the board in the dark could silently switch Bluetooth off.
+      holdSwallow = !oledAwake;
+      pressAt = millis();
+      drawScreen();
+    } else {
+      uint32_t held = millis() - pressAt;
+      holdHint = "";
+      if (holdSwallow) {
+        drawScreen();
+      } else if (held >= HOLD_OFF_MS) {
+        powerDown();
+      } else if (held >= HOLD_BT_MS) {
+        bleSetEnabled(!bleEnabled);
+        drawScreen();
+      } else if (held >= HOLD_SCREEN_MS) {
+        oledOff();
+      } else {
+        drawScreen();
+      }
+    }
+  }
+
+  if (down && !holdSwallow) {
+    uint32_t held = millis() - pressAt;
+    String want;
+    if (held >= HOLD_OFF_MS) want = "release: power off";
+    else if (held >= HOLD_BT_MS) want = bleEnabled ? "release: bluetooth off" : "release: bluetooth on";
+    else if (held >= HOLD_SCREEN_MS) want = "release: screen off";
+    if (want != holdHint) {
+      holdHint = want;
       drawScreen();
     }
   }

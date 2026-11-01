@@ -148,6 +148,29 @@ To spare the battery the screen blanks after a minute of silence; any message
 or a press of the PRG button brings it back. When a LiPo is attached its
 voltage appears in the corner and in `/status`.
 
+## PRG button
+
+The board has one control, so the action is chosen by how long you hold it.
+While you hold, the bottom of the screen names what releasing would do, so you
+never have to remember the table:
+
+| Hold | Action |
+| --- | --- |
+| tap | Wake the screen / refresh the stats |
+| 1.2 s | Screen off now, instead of waiting out the minute |
+| 3 s | Bluetooth on/off (remembered across reboots) |
+| 6 s | Power off - deep sleep. Hold PRG again to wake |
+
+A press while the screen is already dark only wakes it. Without that, reaching
+for the board in the dark could silently switch Bluetooth off.
+
+Power off is a real deep sleep: the CPU, the SX1262 and Bluetooth all stop and
+the Vext rail is cut, leaving only the RTC watching the button. The board is
+deaf while off - it is for stowing one in a bag, not for saving power between
+messages. Waking is a fresh boot (`rst:0x5 (DSLEEP)`), so the radio comes back
+on the settings in flash rather than whatever `/sf` last left it on. `/off`
+does the same thing from a terminal.
+
 ## Ping/pong link test
 
 ```powershell
